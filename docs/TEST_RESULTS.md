@@ -14,8 +14,8 @@ Python 3.11.2). Nothing is reported that was not run.
 | `npx eslint .` (`npm run lint`) | **exit 0 · 0 errors · 44 warnings** | all warnings pre-existing (`react-hooks/set-state-in-effect`, unused-disable) |
 | `npx next build` | **exit 0** | compiled successfully, 59 pages, all API routes built |
 | `npm run build` | **exit 0** | includes standalone copy (`scripts/copy-standalone.mjs`) |
-| `npx bun test` (full) | **663 pass · 134 fail · 2 095 expects · 50 files** | **all 134 failures are the missing Prisma engine**, see §3 |
-| `npx bun test <29 DB-free files>` | **471 pass · 0 fail · exit 0** | the complete non-database suite |
+| `npx bun test` (full) | **671 pass · 134 fail · 2 121 expects · 51 files** | **all 134 failures are the missing Prisma engine**, see §3 |
+| `npx bun test <30 DB-free files>` | **479 pass · 0 fail · exit 0** | the complete non-database suite |
 | `npx bun test` (before the client existed) | 423 pass · 26 fail · 21 errors | every failure `@prisma/client did not initialize yet` |
 
 No test was deleted, skipped or weakened.
@@ -31,7 +31,8 @@ No test was deleted, skipped or weakened.
 | `tests/action-lifecycle.test.ts` | 21 | phase order, terminal phases, exactly-once final speech, approval phrasing, task-status mapping |
 | `tests/voice-feedback.test.ts` | 18 | success speaks, failure speaks, bridge down → browser voice, no engine → visible error, no overlap, dedupe, empty text, fences, abort |
 | `tests/model-migration-notice.test.ts` | 3 | retired model is migrated **with** a notice, valid models untouched, non-Gemini ids untouched |
-| **Total new** | **88** | |
+| `tests/provider-routes.test.ts` | 8 | route contract: key in the POST body (never in a URL), live/cached/catalog provenance, chat-only filtering, 404 for unknown providers, test result persisted, failure category preserved, no secret in the response, stored key fallback |
+| **Total new** | **96** | |
 
 Existing suites that cover the repaired area and still pass: `provider-status-regressions` (8),
 `routing-policy` (12), `model-router` (23), `voice-regressions` (20), `voice-stream` (22), `gemini-model` (10),
@@ -63,7 +64,7 @@ Prisma Client could not locate the Query Engine for runtime "debian-openssl-3.0.
 
 **All 134 failures are of this one kind** (verified across the failing files: audit trail, automation, memory,
 knowledge, provider config, task lifecycle, subsystems, …). None is an assertion failure caused by the
-changes; the 29 database-free files pass 471/471, including every provider, model, voice, routing and
+changes; the 30 database-free files pass 479/479, including every provider, model, voice, routing and
 security suite.
 
 On a normal Windows machine with internet access:
@@ -75,7 +76,7 @@ npx prisma db push
 npm run test
 ```
 
-is expected to run the full 797-test suite with a real SQLite database.
+is expected to run the full 805-test suite with a real SQLite database.
 
 ---
 

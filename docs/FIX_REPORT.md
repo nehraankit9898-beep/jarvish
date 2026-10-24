@@ -9,6 +9,35 @@ Line numbers refer to the **repaired** files.
 
 ---
 
+## 0. Prioritized bug list (reproduced before editing)
+
+Severity: **P0** breaks the primary promise (connect / speak), **P1** produces a wrong or unsafe state,
+**P2** degrades clarity.
+
+| # | Sev | Symptom | Evidence in the code before the fix |
+|---|---|---|---|
+| 1 | **P0** | Gemini never connects | `providers.ts` defaulted to `gemini-2.0-flash`, a family shut down by Google on 2026-10-20 → every request 404 |
+| 2 | **P0** | OpenRouter never connects on the free plan | the catalog's default pointed at a retired free Gemini variant; fallback could pick a **paid** model |
+| 3 | **P0** | "Connected" without a working connection | success was decided by HTTP status; blocked/empty/malformed bodies counted as OK |
+| 4 | **P0** | JARVIS silent by default | `useSpeechOutput` initialised `enabled = false` and did not persist the toggle |
+| 5 | **P0** | Actions ran without a spoken outcome | `runAsTask()` wrote an acknowledgement to the transcript but never spoke it; nothing spoke the terminal result |
+| 6 | **P0** | Voice failures disappeared | `runSpeechChain` returned silently when the bridge and the browser voice were both unavailable |
+| 7 | **P0** | No offline mode | `grep -ri offline studio/src/lib` matched only docs/voice-wake — no deterministic command layer existed |
+| 8 | **P1** | Save could erase a stored key | the save payload always included `apiKey`, empty string included |
+| 9 | **P1** | Keys could leak into URLs/logs | model discovery accepted `?apiKey=…` |
+| 10 | **P1** | "Connected" survived edits | `connected` was a stored boolean with no link to the configuration that was tested |
+| 11 | **P1** | Connection results were not stored | the test route returned a result but never recorded `lastTestedAt/lastTestOk/lastError` |
+| 12 | **P1** | Stale/retired model rewritten silently | `loadConnections()` mutated the saved model with no notice |
+| 13 | **P1** | Model list was static and unlabelled | one array, no source/timestamp; could be mistaken for a live list |
+| 14 | **P2** | Model picker offered embeddings/TTS as chat models | no capability metadata |
+| 15 | **P2** | "Test voice" did nothing while muted | it called `speak()`, which honours the mute toggle |
+| 16 | **P2** | Providers panel had no status detail | no timestamps, categories, free/legacy markers |
+| 17 | **P2** | Offline exchanges vanished from history | the offline path never persisted its messages (fixed via `op:'log'`) |
+
+Each row is addressed in the sections below; every claim is backed by a test listed in `TEST_RESULTS.md`.
+
+---
+
 ## 1. Why Gemini and OpenRouter did not connect
 
 ### 1.1 Gemini — the default model had been shut down by Google
@@ -149,6 +178,7 @@ studio/tests/offline-commands.test.ts        (20)
 studio/tests/action-lifecycle.test.ts        (21)
 studio/tests/voice-feedback.test.ts          (18)
 studio/tests/model-migration-notice.test.ts  (3)
+studio/tests/provider-routes.test.ts         (8)
 ```
 
 **Modified**
