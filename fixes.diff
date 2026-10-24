@@ -1,0 +1,844 @@
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/automation.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/automation.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/automation.ts	2026-10-23 13:23:54.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/automation.ts	2026-10-24 02:46:30.575471939 +0000
+@@ -334,6 +334,11 @@
+ /** Is this schedule already running? */
+ export async function isScheduleBusy(scheduleId: string): Promise<boolean> {
+   if (starting.has(scheduleId)) return true;
++  return dbBusy(scheduleId);
++}
++
++/** DB-only half of the busy check (the in-process claim lives in `starting`). */
++async function dbBusy(scheduleId: string): Promise<boolean> {
+   const run = await db.automationRun.findFirst({
+     where: { scheduleId, status: 'running' },
+     select: { id: true },
+@@ -354,26 +359,32 @@
+   const schedule = await db.automationSchedule.findUnique({ where: { id: scheduleId } });
+   if (!schedule) throw new AutomationError('id', 'Schedule not found');
+ 
+-  if (await isScheduleBusy(scheduleId)) {
+-    const skipped = await db.automationRun.create({
+-      data: {
+-        scheduleId,
+-        status: 'skipped',
+-        error: 'Schedule is already running — duplicate run prevented',
+-      },
+-    });
+-    await recordAudit({
+-      actor: 'system',
+-      action: 'automation.skip',
+-      category: 'automation',
+-      approval: 'auto',
+-      details: { scheduleId, reason: 'already_running' },
+-    });
+-    return toRunDto(skipped);
+-  }
+-
+-  starting.add(scheduleId);
++  // M5 (TOCTOU): the old flow checked `isScheduleBusy` (an ASYNC db read) and
++  // only THEN added the in-process claim — two overlapping ticks could both
++  // pass the check during the await and both start a run. The claim is now
++  // taken SYNCHRONOUSLY (check + add with no await in between) before any
++  // database busy-check, which closes the race inside the process.
++  const alreadyClaimed = starting.has(scheduleId);
++  if (!alreadyClaimed) starting.add(scheduleId);
+   try {
++    if (alreadyClaimed || (await dbBusy(scheduleId))) {
++      const skipped = await db.automationRun.create({
++        data: {
++          scheduleId,
++          status: 'skipped',
++          error: 'Schedule is already running — duplicate run prevented',
++        },
++      });
++      await recordAudit({
++        actor: 'system',
++        action: 'automation.skip',
++        category: 'automation',
++        approval: 'auto',
++        details: { scheduleId, reason: 'already_running' },
++      });
++      return toRunDto(skipped);
++    }
++
+     const run = await db.automationRun.create({
+       data: { scheduleId, status: 'running' },
+     });
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/browser/browser-service.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/browser/browser-service.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/browser/browser-service.ts	2026-10-23 09:59:28.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/browser/browser-service.ts	2026-10-24 02:48:18.637000035 +0000
+@@ -436,7 +436,17 @@
+   const intel = await extractIntel(sessionId);
+   const guard = paymentGuardDecision(intel);
+   const targetLooksLikePay = /pay|purchase|buy|place.?order|subscribe|checkout/i.test(target);
+-  if (guard.requiresConfirmation && targetLooksLikePay && !opts.confirmPayment) {
++  // C4: the commit button on a payment page is usually clicked through a
++  // STRUCTURALLY neutral selector ("button[type=submit]", "form button",
++  // "input[type=submit]", "[role=button]") — the guard must not depend on the
++  // word "pay" appearing in the selector text. When the page intel says this
++  // is a payment surface, ANY submit-like click is treated as a payment commit
++  // and requires the user's explicit confirm flag (the agent tool layer can
++  // never set it).
++  const SUBMIT_TARGET_RE =
++    /button|\[\s*type\s*=\s*["']?submit|input\s*\[\s*type\s*=\s*["']?submit|\[\s*role\s*=\s*["']?button/i;
++  const commitLike = targetLooksLikePay || SUBMIT_TARGET_RE.test(target);
++  if (guard.requiresConfirmation && commitLike && !opts.confirmPayment) {
+     await recordAudit({
+       actor: opts.actor === 'agent' ? 'agent:coder' : 'user',
+       action: 'browser.payment_blocked',
+@@ -473,19 +483,35 @@
+   if (opts.actor === 'agent') await assertAgentMayAct(sessionId);
+ 
+   const intel = await extractIntel(sessionId);
+-  // find which fields are sensitive by matching selector text against the
+-  // intel's sensitive fields — the agent may never type into them
+-  const sensitiveHay = intel.forms
++  // Sensitive fields are matched PER FIELD (selector ↔ intel field tokens):
++  // the previous check tested the selector against the joined list of ALL
++  // sensitive fields, which (a) refused every fill on any page that contained
++  // a password field somewhere and (b) let a card field whose name did not hit
++  // the keyword regex (e.g. autocomplete="cc-number") slip through.
++  const SENSITIVE_KIND_RE =
++    /card|cc-?num|cvc|cvv|csc|cid|\bpan\b|expir|exp[-_ ]?(date|month|year)|password|passphrase|\bpin\b|\botp\b|secret|ssn|security.?code/i;
++  const sensitiveTokens = intel.forms
+     .flatMap((f) => f.fields.filter((fl) => fl.sensitive))
+-    .map((fl) => `${fl.name} ${fl.label} ${fl.autocomplete}`)
+-    .join(' | ');
++    .flatMap((fl) => [fl.name, fl.autocomplete ?? '', ...fl.label.split(/\s+/)])
++    .map((t) => t.trim().toLowerCase())
++    .filter((t) => t.length >= 3);
++  const selectorHitsSensitive = (sel: string): boolean => {
++    if (SENSITIVE_KIND_RE.test(sel)) return true;
++    const selTokens = sel
++      .toLowerCase()
++      .split(/[^a-z0-9_-]+/)
++      .filter((t) => t.length >= 3);
++    return selTokens.some((st) =>
++      sensitiveTokens.some((t) => t.includes(st) || st.includes(t))
++    );
++  };
+ 
+   const filled: string[] = [];
+   const refused: string[] = [];
+   for (const field of fields.slice(0, 30)) {
+     const sel = String(field.selector ?? '').slice(0, 300);
+     const value = String(field.value ?? '').slice(0, 5000);
+-    if (opts.actor === 'agent' && /card|cvv|cvc|expir|password|otp|pin|ssn/i.test(`${sel} ${sensitiveHay}`.slice(0, 2000))) {
++    if (opts.actor === 'agent' && selectorHitsSensitive(sel)) {
+       refused.push(sel);
+       continue;
+     }
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/cron.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/cron.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/cron.ts	2026-10-23 13:23:42.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/cron.ts	2026-10-24 02:43:13.405516944 +0000
+@@ -233,23 +233,36 @@
+     return off2 === off ? exact : new Date(Date.UTC(y, m - 1, d, h, min) - off2);
+   };
+ 
++  // C2: a wall-clock time inside a DST GAP (spring-forward, e.g. 02:30 on the
++  // night clocks jump 02:00→03:00) does not exist. `toUtc` then resolves it to
++  // a UTC instant whose wall clock is EARLIER than the cursor that produced it
++  // — the scan would recompute the same cursor forever and freeze the server.
++  // `advance` guarantees the cursor moves forward on every iteration; if a
++  // candidate does not progress, we step one minute past the previous cursor
++  // and keep scanning (the run lands after the gap, typically next day).
++  let prevMs = cursor.getTime();
++  const advance = (candidate: Date): void => {
++    cursor = candidate.getTime() > prevMs ? candidate : new Date(prevMs + 60_000);
++  };
++
+   while (cursor <= limit) {
++    prevMs = cursor.getTime();
+     const w = wallParts(cursor, timezone);
+ 
+     // 1) month
+     if (!field.months.has(w.m)) {
+       const nextMonth = [...field.months].sort((a, b) => a - b).find((m) => m > w.m);
+       if (nextMonth === undefined) {
+-        cursor = toUtc(w.y + 1, Math.min(...field.months), 1, 0, 0);
++        advance(toUtc(w.y + 1, Math.min(...field.months), 1, 0, 0));
+       } else {
+-        cursor = toUtc(w.y, nextMonth, 1, 0, 0);
++        advance(toUtc(w.y, nextMonth, 1, 0, 0));
+       }
+       continue;
+     }
+ 
+     // 2) day of month / day of week (standard OR rule)
+     if (!dayMatches(field, w.m, w.d, w.dow)) {
+-      cursor = toUtc(w.y, w.m, w.d + 1, 0, 0);
++      advance(toUtc(w.y, w.m, w.d + 1, 0, 0));
+       continue;
+     }
+ 
+@@ -257,9 +270,9 @@
+     if (!field.hours.has(w.h)) {
+       const nextH = sortedHours.find((h) => h > w.h);
+       if (nextH === undefined) {
+-        cursor = toUtc(w.y, w.m, w.d + 1, 0, 0);
++        advance(toUtc(w.y, w.m, w.d + 1, 0, 0));
+       } else {
+-        cursor = toUtc(w.y, w.m, w.d, nextH, sortedMinutes[0]);
++        advance(toUtc(w.y, w.m, w.d, nextH, sortedMinutes[0]));
+       }
+       continue;
+     }
+@@ -270,19 +283,19 @@
+       if (nextMin === undefined) {
+         const nextH = sortedHours.find((h) => h > w.h);
+         if (nextH === undefined) {
+-          cursor = toUtc(w.y, w.m, w.d + 1, 0, 0);
++          advance(toUtc(w.y, w.m, w.d + 1, 0, 0));
+         } else {
+-          cursor = toUtc(w.y, w.m, w.d, nextH, sortedMinutes[0]);
++          advance(toUtc(w.y, w.m, w.d, nextH, sortedMinutes[0]));
+         }
+       } else {
+-        cursor = toUtc(w.y, w.m, w.d, w.h, nextMin);
++        advance(toUtc(w.y, w.m, w.d, w.h, nextMin));
+       }
+       continue;
+     }
+ 
+     // all fields match — but make sure we are genuinely AFTER `from`
+     if (cursor.getTime() > from.getTime()) return cursor;
+-    cursor = new Date(cursor.getTime() + 60_000);
++    advance(new Date(prevMs + 60_000));
+   }
+   return null;
+ }
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/custom-tools.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/custom-tools.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/custom-tools.ts	2026-10-23 07:16:22.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/custom-tools.ts	2026-10-24 02:46:03.506340105 +0000
+@@ -237,7 +237,14 @@
+     actor: opts.actor ?? 'user',
+     action: `tool.${decision}`,
+     category: 'tool',
+-    approval: decision === 'approve' ? 'approved' : 'auto',
++    // M3: the audit verdict must reflect the decision — a REJECTED tool was
++    // labelled 'auto' (as if nobody had decided), which mislabelled the trail.
++    approval:
++      decision === 'approve'
++        ? 'approved'
++        : decision === 'reject'
++          ? 'denied'
++          : 'auto',
+     details: { toolId: id, name: row.name, status },
+   });
+   return { ok: true, status };
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/git-tools.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/git-tools.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/git-tools.ts	2026-10-23 06:54:02.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/git-tools.ts	2026-10-24 02:47:14.849689186 +0000
+@@ -44,20 +44,42 @@
+   return trimmed;
+ }
+ 
++/**
++ * M6: run one git command and THROW when it fails. Every call site used to
++ * ignore `exitCode`, so a failed `git commit` still "succeeded" and
++ * `snapshot()` happily returned the PREVIOUS head hash as a fresh snapshot
++ * (rollback to a state that was never saved). `git diff` exits 0 normally —
++ * a non-zero exit is always a real failure.
++ */
++async function runGit(
++  taskId: string,
++  args: string[],
++  opts: { logical: string; timeoutMs: number; autoApproveDestructive?: boolean }
++): Promise<{ output: string }> {
++  const res = await executeArgv(taskId, 'git', args, opts);
++  if (res.exitCode !== 0) {
++    const detail = (res.output || '').trim().split('\n').slice(-3).join(' | ').slice(0, 300);
++    throw new Error(
++      `git ${args[0]} failed (exit ${res.exitCode ?? 'null'})${detail ? `: ${detail}` : ''}`
++    );
++  }
++  return res;
++}
++
+ /** git init + initial baseline commit (idempotent). */
+ export async function ensureRepo(taskId: string, taskLabel = 'baseline'): Promise<void> {
+-  await executeArgv(taskId, 'git', ['init', '-q'], { logical: 'git init -q', timeoutMs: 30_000 });
+-  await executeArgv(taskId, 'git', ['config', 'user.email', 'agentic@studio.local'], {
++  await runGit(taskId, ['init', '-q'], { logical: 'git init -q', timeoutMs: 30_000 });
++  await runGit(taskId, ['config', 'user.email', 'agentic@studio.local'], {
+     logical: 'git config user.email "agentic@studio.local"',
+     timeoutMs: 10_000,
+   });
+-  await executeArgv(taskId, 'git', ['config', 'user.name', 'Agentic Engine'], {
++  await runGit(taskId, ['config', 'user.name', 'Agentic Engine'], {
+     logical: 'git config user.name "Agentic Engine"',
+     timeoutMs: 10_000,
+   });
+   // Disable background auto-gc: a lingering `git gc` process keeps the
+   // workspace directory busy on Windows and blocks workspace cleanup.
+-  await executeArgv(taskId, 'git', ['config', 'gc.auto', '0'], {
++  await runGit(taskId, ['config', 'gc.auto', '0'], {
+     logical: 'git config gc.auto 0',
+     timeoutMs: 10_000,
+   });
+@@ -69,11 +91,10 @@
+     'node_modules/\n__pycache__/\n.venv/\nvenv/\n.next/\ndist/\n',
+     'utf-8'
+   );
+-  await executeArgv(taskId, 'git', ['add', '-A'], { logical: 'git add -A', timeoutMs: 30_000 });
++  await runGit(taskId, ['add', '-A'], { logical: 'git add -A', timeoutMs: 30_000 });
+   const label = sanitizeLabel(taskLabel);
+-  await executeArgv(
++  await runGit(
+     taskId,
+-    'git',
+     ['commit', '-q', '-m', `baseline: ${label}`, '--allow-empty', '--'],
+     { logical: 'git commit -qm "baseline" --allow-empty', timeoutMs: 30_000 }
+   );
+@@ -89,13 +110,13 @@
+ 
+ /** Commit current state; returns the snapshot hash. */
+ export async function snapshot(taskId: string, label: string): Promise<Snapshot> {
+-  await executeArgv(taskId, 'git', ['add', '-A'], { logical: 'git add -A', timeoutMs: 30_000 });
++  await runGit(taskId, ['add', '-A'], { logical: 'git add -A', timeoutMs: 30_000 });
+   const clean = sanitizeLabel(label);
+-  await executeArgv(taskId, 'git', ['commit', '-q', '-m', clean, '--allow-empty', '--'], {
++  await runGit(taskId, ['commit', '-q', '-m', clean, '--allow-empty', '--'], {
+     logical: 'git commit -qm "snapshot" --allow-empty',
+     timeoutMs: 30_000,
+   });
+-  const rev = await executeArgv(taskId, 'git', ['rev-parse', '--short', 'HEAD'], {
++  const rev = await runGit(taskId, ['rev-parse', '--short', 'HEAD'], {
+     logical: 'git rev-parse --short HEAD',
+     timeoutMs: 10_000,
+   });
+@@ -114,15 +135,13 @@
+ ): Promise<string> {
+   const safeFrom = assertSafeGitRef(from);
+   const safeTo = assertSafeGitRef(to);
+-  const res = await executeArgv(
++  const res = await runGit(
+     taskId,
+-    'git',
+     ['diff', safeFrom, safeTo, '--stat', '--unified=3'],
+     { logical: `git diff ${safeFrom} ${safeTo} --stat --unified=3`, timeoutMs: 30_000 }
+   );
+-  const full = await executeArgv(
++  const full = await runGit(
+     taskId,
+-    'git',
+     ['diff', safeFrom, safeTo, '--unified=3'],
+     { logical: `git diff ${safeFrom} ${safeTo} --unified=3`, timeoutMs: 30_000 }
+   );
+@@ -137,9 +156,8 @@
+ ): Promise<string[]> {
+   const safeFrom = assertSafeGitRef(from);
+   const safeTo = assertSafeGitRef(to);
+-  const res = await executeArgv(
++  const res = await runGit(
+     taskId,
+-    'git',
+     ['diff', '--name-only', safeFrom, safeTo],
+     { logical: `git diff --name-only ${safeFrom} ${safeTo}`, timeoutMs: 30_000 }
+   );
+@@ -151,7 +169,7 @@
+ 
+ /** Resolve the baseline (first) commit hash. */
+ export async function baselineRef(taskId: string): Promise<string> {
+-  const res = await executeArgv(taskId, 'git', ['rev-list', '--max-parents=0', 'HEAD'], {
++  const res = await runGit(taskId, ['rev-list', '--max-parents=0', 'HEAD'], {
+     logical: 'git rev-list --max-parents=0 HEAD',
+     timeoutMs: 15_000,
+   });
+@@ -161,12 +179,12 @@
+ /** Rollback the working tree to a snapshot (git reset --hard inside ISOLATED workspace only). */
+ export async function rollbackTo(taskId: string, ref: string): Promise<void> {
+   const safeRef = assertSafeGitRef(ref);
+-  await executeArgv(taskId, 'git', ['reset', '--hard', safeRef], {
++  await runGit(taskId, ['reset', '--hard', safeRef], {
+     logical: `git reset --hard ${safeRef}`,
+     timeoutMs: 30_000,
+     autoApproveDestructive: true, // user explicitly requested rollback in UI; workspace is isolated
+   });
+-  await executeArgv(taskId, 'git', ['clean', '-fdq'], {
++  await runGit(taskId, ['clean', '-fdq'], {
+     logical: 'git clean -fdq',
+     timeoutMs: 30_000,
+     autoApproveDestructive: true,
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/goals.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/goals.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/goals.ts	2026-10-23 07:14:44.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/goals.ts	2026-10-24 02:44:48.312974229 +0000
+@@ -102,20 +102,82 @@
+   if (!Array.isArray(json.tasks) || json.tasks.length === 0) {
+     throw new Error('Goal decomposition empty hai');
+   }
+-  const tasks: GoalTaskSpec[] = json.tasks.slice(0, 12).map((t: Record<string, unknown>, i: number) => ({
+-    index: i + 1,
+-    title: String(t.title ?? `Task ${i + 1}`).slice(0, 160),
+-    prompt: String(t.prompt ?? '').slice(0, 4000),
+-    dependsOn: Array.isArray(t.dependsOn)
+-      ? (t.dependsOn as unknown[])
+-          .map((d) => Number(d))
+-          .filter((n) => Number.isFinite(n) && n >= 1 && n <= Math.min(json.tasks.length, 12) && n !== i + 1)
+-      : [],
+-  })).filter((t) => t.prompt.trim().length >= 8);
+-  if (!tasks.length) throw new Error('Goal decomposition me koi valid task nahi mila');
++  // H3: validate/dedupe FIRST, then assign indexes. The previous code numbered
++  // every raw task BEFORE the validity filter, so a dropped task left DANGLING
++  // dependsOn indexes behind — nextRunnableSpec then found no runnable spec
++  // forever and the goal stalled silently.
++  const valid = json.tasks.slice(0, 12)
++    .map((t: Record<string, unknown>, i: number) => ({
++      oldIndex: i + 1,
++      title: String(t.title ?? `Task ${i + 1}`).slice(0, 160),
++      prompt: String(t.prompt ?? '').slice(0, 4000),
++      rawDeps: Array.isArray(t.dependsOn)
++        ? (t.dependsOn as unknown[]).map((d) => Number(d))
++        : [],
++    }))
++    .filter((t) => t.prompt.trim().length >= 8);
++  if (!valid.length) throw new Error('Goal decomposition me koi valid task nahi mila');
++
++  // Tasks are matched back to created rows BY PROMPT (see getGoal/listGoals),
++  // so two identical prompts would bind two specs to the same task row —
++  // dedupe them (keep the first).
++  const seenPrompts = new Set<string>();
++  const kept = valid.filter((t) => {
++    const key = t.prompt.trim();
++    if (seenPrompts.has(key)) return false;
++    seenPrompts.add(key);
++    return true;
++  });
++
++  // old index → new sequential index
++  const remap = new Map<number, number>();
++  kept.forEach((t, i) => remap.set(t.oldIndex, i + 1));
++
++  const tasks: GoalTaskSpec[] = kept.map((t, i) => {
++    const deps: number[] = [];
++    for (const d of t.rawDeps) {
++      // drop self refs, out-of-range refs and refs to dropped tasks —
++      // anything else would park this spec behind a dependency that can
++      // never complete
++      const mapped = remap.get(d);
++      if (mapped === undefined || mapped === i + 1) continue;
++      if (!deps.includes(mapped)) deps.push(mapped);
++    }
++    return {
++      index: i + 1,
++      title: t.title,
++      prompt: t.prompt,
++      dependsOn: deps,
++    };
++  });
++
++  // a dependency CYCLE in the decomposition would also stall the goal —
++  // fall back to plain sequential execution (drop all edges) when one exists
++  if (hasDependencyCycle(tasks)) {
++    for (const t of tasks) t.dependsOn = [];
++  }
++
+   return { title: String(json.title ?? 'Goal').slice(0, 200), tasks };
+ }
+ 
++/** true when the dependsOn graph of the specs contains a cycle. */
++function hasDependencyCycle(tasks: GoalTaskSpec[]): boolean {
++  const byIndex = new Map(tasks.map((t) => [t.index, t]));
++  const state = new Map<number, 'visiting' | 'done'>();
++  const visit = (index: number): boolean => {
++    const cur = state.get(index);
++    if (cur === 'done') return false;
++    if (cur === 'visiting') return true; // back-edge → cycle
++    state.set(index, 'visiting');
++    for (const dep of byIndex.get(index)?.dependsOn ?? []) {
++      if (byIndex.has(dep) && visit(dep)) return true;
++    }
++    state.set(index, 'done');
++    return false;
++  };
++  return tasks.some((t) => visit(t.index));
++}
++
+ export async function createGoal(input: {
+   title: string;
+   description: string;
+@@ -193,6 +255,10 @@
+   tasks: { index: number; taskStatus: string | null; taskId: string }[]
+ ): GoalTaskSpec | null {
+   const statusOfSpec = new Map(tasks.map((t) => [t.index, t]));
++  // H3 (defensive): a dependency that points at an index that does not exist
++  // in the spec list can never become 'done' — ignore it instead of parking
++  // the goal behind it forever.
++  const known = new Set(specs.map((s) => s.index));
+   for (const spec of specs) {
+     const existing = statusOfSpec.get(spec.index);
+     if (existing?.taskId) {
+@@ -200,10 +266,12 @@
+       if (!['done', 'failed', 'cancelled'].includes(existing.taskStatus ?? '')) return null;
+       continue;
+     }
+-    const depsDone = spec.dependsOn.every((dep) => {
+-      const st = statusOfSpec.get(dep)?.taskStatus;
+-      return st === 'done';
+-    });
++    const depsDone = spec.dependsOn
++      .filter((dep) => known.has(dep))
++      .every((dep) => {
++        const st = statusOfSpec.get(dep)?.taskStatus;
++        return st === 'done';
++      });
+     if (depsDone) return spec;
+   }
+   return null;
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/host-control.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/host-control.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/host-control.ts	2026-10-23 13:25:04.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/host-control.ts	2026-10-24 02:42:42.503364623 +0000
+@@ -300,8 +300,10 @@
+         return { permission: 'forbidden', reason: check.reason, paths: [cwd] };
+       }
+       // a command on the real machine is never "safe": at best it is review-class,
+-      // and shell metacharacters (pipes, redirects, substitution) escalate it
+-      const meta = /[;|&$`()<>]/.test(command);
++      // and shell metacharacters (pipes, redirects, substitution) escalate it.
++      // C1: a NEWLINE is a command separator like `;` — a multi-line payload
++      // executes every line, so it escalates the same way.
++      const meta = /[;|&$`()<>\n\r]/.test(command);
+       if (check.permission === 'destructive' || meta) {
+         return {
+           permission: 'destructive',
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/message-bus.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/message-bus.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/message-bus.ts	2026-10-23 06:54:02.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/message-bus.ts	2026-10-24 02:45:48.742268391 +0000
+@@ -219,9 +219,12 @@
+     agent?: string,
+     limit = 200
+   ): Promise<AgentMessage[]> {
++    // M1: fetch the NEWEST rows first (descending). The previous
++    // `orderBy asc + take` returned the OLDEST window of the conversation, so
++    // a long-running task never saw its recent messages again.
+     const rows = await db.agentMessage.findMany({
+       where: { taskId: this.taskId, conversationId: this.conversationId },
+-      orderBy: { seq: 'asc' },
++      orderBy: { seq: 'desc' },
+       take: limit * 2,
+     });
+     let list: AgentMessage[] = rows.map((r) => ({
+@@ -243,7 +246,8 @@
+     if (agent && this.visibility === 'none') {
+       list = list.filter((m) => m.toAgent === agent || m.fromAgent === agent);
+     }
+-    return list.slice(-limit);
++    // rows are newest-first → restore chronological order and keep the tail
++    return list.reverse().slice(-limit);
+   }
+ }
+ 
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/orchestrator.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/orchestrator.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/orchestrator.ts	2026-10-23 13:25:32.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/orchestrator.ts	2026-10-24 02:43:24.350570722 +0000
+@@ -1873,6 +1873,13 @@
+         emit,
+         readOnlyStep
+       );
++      // C3: the batch was aborted because the task was cancelled mid-run.
++      // The flag MUST be checked here — falling through would mark the step
++      // 'passed' (and snapshot it) even though its commands never completed.
++      if (batch.cancelled) {
++        await stepLog(step.id, 'info', 'Task cancelled while the command batch was running — step not marked passed.');
++        return { kind: 'cancelled' };
++      }
+       if (batch.blocked) return { kind: 'awaiting_approval' }; // paused for approval — resume continues
+ 
+       if (batch.fail) {
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/permissions.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/permissions.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/permissions.ts	2026-10-23 06:54:02.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/permissions.ts	2026-10-24 02:42:23.135268658 +0000
+@@ -238,6 +238,43 @@
+   return { targets, rest };
+ }
+ 
++/**
++ * find/grep/rg flags that BULK-DELETE or EXECUTE against every match.
++ * A bare `find` is safe (read-only listing) but `find . -name '*.log' -delete`
++ * destroys data, so it must escalate to destructive (H1).
++ */
++const FIND_BULK_HARM_RE = /(?:^|\s)-delete\b/;
++
++/** mv/cp with a target OUTSIDE the workspace — moving/copying INTO system or
++ *  home locations must never auto-run (H2: `mv a.txt /etc/passwd`).
++ *  The DESTINATION is the last whitespace-delimited token of the command. */
++function classifyFileMoveTarget(part: string): { permission: Permission; reason: string } | null {
++  const m = part.match(/^(?:mv|cp)\s+([\s\S]+)$/);
++  if (!m) return null;
++  const rest = m[1].trim();
++  if (!rest) return null;
++  // last token = destination; strip surrounding quotes
++  const tokens = rest.split(/\s+/);
++  const destRaw = tokens[tokens.length - 1] ?? '';
++  const dest = stripOuterQuotes(destRaw);
++  const isEscapeTarget =
++    dest.startsWith('/') ||
++    dest.startsWith('~') ||
++    /^\$HOME/i.test(dest) ||
++    /^[A-Za-z]:[\\/]/.test(dest);
++  if (!isEscapeTarget) return null; // relative target stays inside the workspace
++  if (SYSTEM_WRITE_TARGETS.some((re) => re.test(dest))) {
++    return {
++      permission: 'destructive',
++      reason: `${part.split(/\s+/)[0]} writes into a system location (${dest}) — approval required`,
++    };
++  }
++  return {
++    permission: 'destructive',
++    reason: `${part.split(/\s+/)[0]} writes outside the workspace (${dest}) — approval required`,
++  };
++}
++
+ function classifyPart(part: string): { permission: Permission; reason: string } {
+   if (FORBIDDEN_PATTERNS.some((re) => re.test(part))) {
+     return {
+@@ -251,6 +288,16 @@
+       reason: 'Can delete/overwrite data or leave the machine — needs approval',
+     };
+   }
++  // H1: a read-only-looking find/grep/rg that actually destroys matches
++  if (/^(find|grep|rg)\b/.test(part) && FIND_BULK_HARM_RE.test(part)) {
++    return {
++      permission: 'destructive',
++      reason: 'find/grep/rg with -delete removes every match — approval required',
++    };
++  }
++  // H2: mv/cp whose DESTINATION is a system or home location
++  const moveVerdict = classifyFileMoveTarget(part);
++  if (moveVerdict) return moveVerdict;
+   if (SAFE_PATTERNS.some((re) => re.test(part))) {
+     return { permission: 'safe', reason: 'Read-only / informational' };
+   }
+@@ -305,7 +352,11 @@
+ }
+ 
+ function classify(rawCommand: string, depth: number): CommandCheck {
+-  const command = String(rawCommand ?? '').trim().replace(/\s+/g, ' ');
++  // NOTE: newlines are deliberately NOT collapsed here — in a POSIX shell a
++  // newline is a command separator exactly like `;`, so a multi-line payload
++  // ("echo hi\nrm -rf x") is TWO commands. Every line is classified
++  // separately below and the strictest verdict wins (C1).
++  const command = String(rawCommand ?? '').trim().replace(/[ \t]+/g, ' ');
+ 
+   if (!command) {
+     return { permission: 'forbidden', reason: 'Empty command' };
+@@ -334,6 +385,14 @@
+     .split(/\s*(?:&&|\|\||;|\||&)\s*/)
+     .map((p) => p.trim())
+     .filter(Boolean);
++
++  // C1: a multi-line command is SEVERAL shell commands — classify every line
++  // on its own so a harmless-looking first line cannot smuggle a destructive
++  // second line ("echo hi\nrm -rf x") past the pattern lists.
++  const lines = String(rawCommand ?? '')
++    .split(/\r?\n/)
++    .map((l) => l.trim())
++    .filter(Boolean);
+   if (parts.length > 6) {
+     return {
+       permission: 'forbidden',
+@@ -354,6 +413,13 @@
+     record(verdict.permission, `${part} → ${verdict.permission}`);
+   }
+ 
++  if (lines.length > 1) {
++    for (const line of lines) {
++      const verdict = classifyPart(line);
++      record(verdict.permission, `line "${line}" → ${verdict.permission}`);
++    }
++  }
++
+   for (const target of targets) {
+     const verdict = classifyRedirectTarget(target);
+     record(verdict.permission, `redirect ${target} → ${verdict.permission}`);
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/provider-store.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/provider-store.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/provider-store.ts	2026-10-23 06:54:02.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/provider-store.ts	2026-10-24 02:48:18.915001390 +0000
+@@ -285,13 +285,21 @@
+     throw new ProviderValidationError('provider', 'Invalid provider id');
+   }
+   const info = getProvider(provider);
+-  const baseUrl = (input.baseUrl ?? '').trim();
+-  if (baseUrl && !/^https?:\/\//i.test(baseUrl)) {
++  // M2: an absent baseUrl must KEEP the stored one — the old code coerced a
++  // missing field to '' and wiped a custom endpoint on every unrelated save
++  // (e.g. a priority/enable toggle). Validation applies only to a PROVIDED url.
++  const providedBaseUrl = input.baseUrl !== undefined ? input.baseUrl.trim() : undefined;
++  if (providedBaseUrl !== undefined && providedBaseUrl && !/^https?:\/\//i.test(providedBaseUrl)) {
+     throw new ProviderValidationError('baseUrl', 'Base URL must start with http:// or https://');
+   }
+ 
+   const existing = await db.providerConfig.findUnique({ where: { provider } });
+   const model = input.model !== undefined ? input.model.trim() : existing?.model ?? '';
++  // M2: an absent baseUrl must KEEP the stored one — the old code coerced a
++  // missing field to '' and wiped a custom endpoint on every unrelated save
++  // (e.g. a priority/enable toggle).
++  const baseUrl =
++    input.baseUrl !== undefined ? input.baseUrl.trim() : existing?.baseUrl ?? '';
+ 
+   let apiKeyEnc = existing?.apiKeyEnc ?? '';
+   let hint = existing?.keyHint ?? '';
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/terminal.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/terminal.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/terminal.ts	2026-10-23 06:54:02.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/terminal.ts	2026-10-24 02:42:42.228363260 +0000
+@@ -88,7 +88,9 @@
+   // shell, so a classifier bypass could lead to arbitrary command execution.
+   // Require explicit approval for those even when classified safe/review.
+   // (forbidden commands already threw above, so check.permission is safe here.)
+-  const HAS_SHELL_META = /[;|&$`()<>]/.test(command);
++  // C1: a NEWLINE is a command separator exactly like `;` — bash executes
++  // every line of a multi-line payload, so it must escalate the same way.
++  const HAS_SHELL_META = /[;|&$`()<>\n\r]/.test(command);
+   const effectivePermission = HAS_SHELL_META ? 'destructive' : check.permission;
+   if (effectivePermission === 'destructive' && !opts.autoApproveDestructive) {
+     if (!approved.has(key) && !approvedRaw.has(command)) {
+diff -ru '--exclude=node_modules' '--exclude=db' '--exclude=.next' pristine-src/agentscope-suite/studio/src/lib/agentic/tool-registry.ts jarvis-src/agentscope-suite/studio/src/lib/agentic/tool-registry.ts
+--- pristine-src/agentscope-suite/studio/src/lib/agentic/tool-registry.ts	2026-10-23 10:01:28.000000000 +0000
++++ jarvis-src/agentscope-suite/studio/src/lib/agentic/tool-registry.ts	2026-10-24 02:45:30.939181759 +0000
+@@ -3,7 +3,7 @@
+ 
+ import { z } from 'zod';
+ import { protect, type SecretScan } from './secrets';
+-import { checkCommand, type Permission } from './permissions';
++import { type Permission } from './permissions';
+ import { executeCommand } from './terminal';
+ import {
+   createWorkspace,
+@@ -125,8 +125,15 @@
+ }
+ 
+ /**
+- * Invoke a registered tool with schema validation, permission enforcement,
+- * timeout, and redaction.
++ * Invoke a registered tool with permission enforcement, timeout, and redaction.
++ *
++ * H4: tool payloads are deliberately NOT run through the shell-command
++ * classifier (`checkCommand`). The old code classified
++ * `${tool} ${JSON.stringify(parameters)}`, so ANY invocation whose JSON
++ * happened to be longer than 500 chars was rejected as "forbidden" — and a
++ * parameter that merely MENTIONED a word like "shutdown" was too. Tool
++ * permission is a declared property (`def.permission`), reviewed at
++ * registration time; destructive tools still require explicit approval below.
+  */
+ export async function invokeTool(invocation: ToolInvocation): Promise<ToolResult> {
+   const def = TOOL_REGISTRY.get(invocation.tool);
+@@ -143,14 +150,13 @@
+     return result;
+   }
+ 
+-  // permission enforcement
+-  const check = checkCommand(`${invocation.tool} ${JSON.stringify(invocation.parameters)}`);
+-  if (def.permission === 'forbidden' || check.permission === 'forbidden') {
++  // permission enforcement — based on the tool's DECLARED permission only
++  if (def.permission === 'forbidden') {
+     const result: ToolResult = {
+       ok: false,
+       error: `Tool ${invocation.tool} is forbidden`,
+       permission: 'forbidden',
+-      reason: check.reason,
++      reason: 'Tool declared forbidden',
+       at: new Date().toISOString(),
+     };
+     auditCall({ tool: invocation.tool, parameters: invocation.parameters, result, taskId: invocation.taskId, at: result.at });
+@@ -171,33 +177,40 @@
+ 
+   try {
+     // run handler with timeout
+-    const result = await Promise.race([
+-      handler(invocation),
+-      new Promise<ToolResult>((_, reject) =>
+-        setTimeout(() => reject(new Error(`Tool timeout after ${def.timeoutMs}ms`)), def.timeoutMs)
+-      ),
+-    ]);
+-
+-    const durationMs = Date.now() - started;
+-    const enriched: ToolResult = {
+-      ...result,
+-      durationMs,
+-      at: new Date().toISOString(),
+-    };
+-
+-    // redact secrets from result data
+-    if (enriched.data !== undefined && typeof enriched.data === 'string') {
+-      const { masked, found } = protect(enriched.data);
+-      enriched.data = masked;
+-      enriched.redacted = found.length > 0 ? { found, masked } : undefined;
+-    }
+-    if (enriched.error && typeof enriched.error === 'string') {
+-      const { masked } = protect(enriched.error);
+-      enriched.error = masked;
++    // L: the losing setTimeout used to stay armed for the full timeout — one
++    // leaked timer per invocation kept the event loop busy for nothing.
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    try {
++      const result = await Promise.race([
++        handler(invocation),
++        new Promise<ToolResult>((_, reject) => {
++          timer = setTimeout(() => reject(new Error(`Tool timeout after ${def.timeoutMs}ms`)), def.timeoutMs);
++        }),
++      ]);
++
++      const durationMs = Date.now() - started;
++      const enriched: ToolResult = {
++        ...result,
++        durationMs,
++        at: new Date().toISOString(),
++      };
++
++      // redact secrets from result data
++      if (enriched.data !== undefined && typeof enriched.data === 'string') {
++        const { masked, found } = protect(enriched.data);
++        enriched.data = masked;
++        enriched.redacted = found.length > 0 ? { found, masked } : undefined;
++      }
++      if (enriched.error && typeof enriched.error === 'string') {
++        const { masked } = protect(enriched.error);
++        enriched.error = masked;
++      }
++
++      auditCall({ tool: invocation.tool, parameters: invocation.parameters, result: enriched, taskId: invocation.taskId, at: enriched.at });
++      return enriched;
++    } finally {
++      if (timer) clearTimeout(timer);
+     }
+-
+-    auditCall({ tool: invocation.tool, parameters: invocation.parameters, result: enriched, taskId: invocation.taskId, at: enriched.at });
+-    return enriched;
+   } catch (err) {
+     const durationMs = Date.now() - started;
+     const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+@@ -495,6 +508,11 @@
+ 
+ /**
+  * Run a health check on a tool by invoking it with minimal parameters.
++ *
++ * M4: `invokeTool` RETURNS a failed result (ok:false) instead of throwing
++ * when the handler errors — treating "did not throw" as healthy made every
++ * tool report ok:true, even broken ones. The result's own ok flag is the
++ * health verdict.
+  */
+ export async function healthCheckTool(toolName: string, taskId: string): Promise<ToolHealthCheck> {
+   const def = TOOL_REGISTRY.get(toolName);
+@@ -503,13 +521,18 @@
+   }
+   const started = Date.now();
+   try {
+-    await invokeTool({
++    const result = await invokeTool({
+       tool: toolName,
+       parameters: {},
+       taskId,
+-      approvedCommands: [],
++      approvedCommands: def.permission === 'destructive' ? [toolName] : [],
+     });
+-    return { tool: toolName, ok: true, latencyMs: Date.now() - started };
++    return {
++      tool: toolName,
++      ok: result.ok === true,
++      latencyMs: Date.now() - started,
++      ...(result.ok === true ? {} : { error: result.error || 'tool returned ok:false' }),
++    };
+   } catch (err) {
+     return { tool: toolName, ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : 'Unknown error' };
+   }

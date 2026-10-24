@@ -1,0 +1,16 @@
+﻿node_modules
+.next
+out
+build
+dist
+*.log
+.env
+.env.local
+.env.*.local
+db/*.db
+db/*.sqlite
+db/*.sqlite-journal
+.prisma
+.agentic-workspace
+coverage
+.DS_Store

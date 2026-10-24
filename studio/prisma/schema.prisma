@@ -1,0 +1,478 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Agent {
+  id           String        @id @default(cuid())
+  name         String
+  emoji        String        @default("🤖")
+  systemPrompt String        @default("You are a helpful AI assistant.")
+  provider     String        @default("zai")
+  model        String        @default("")
+  temperature  Float         @default(0.7)
+  isActive     Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  conversations Conversation[]
+}
+
+model Conversation {
+  id        String    @id @default(cuid())
+  title     String    @default("New Chat")
+  agentId   String?
+  agent     Agent?    @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String
+  content        String
+  provider       String       @default("")
+  model          String       @default("")
+  createdAt      DateTime     @default(now())
+}
+
+model AgenticTask {
+  id            String   @id @default(cuid())
+  prompt        String
+  status        String   @default("planning") // planning | awaiting_approval | running | paused | done | failed | cancelled
+  plan          String   @default("") // JSON: PlanStep[]
+  currentStep   Int      @default(0)
+  report        String? // JSON: final report
+  error         String?
+  workspacePath String   @default("")
+  provider      String   @default("zai")
+  model         String   @default("")
+  events        String   @default("[]") // JSON: AgenticEvent[] (legacy blob, superseded by AgentEvent rows)
+  pendingCommand String? // JSON: command awaiting approval
+  agentConfig   String   @default("") // JSON: per-role model routing config (never contains API keys)
+  /// absolute path of the project this task works on — the project index is
+  /// searched for relevant code before every step
+  projectRoot   String   @default("")
+  conversationId String  @default("") // id of the agent-to-agent conversation of this task
+  eventSeq      Int      @default(0) // monotonic counter for AgentEvent.seq
+  messageSeq    Int      @default(0) // monotonic counter for AgentMessage.seq
+  retriesUsed   Int      @default(0) // monotonic counter of repair attempts across the whole task
+  startedAt     DateTime? // set on the first run — the overall task timeout is measured from here
+  /// long-running goal this task belongs to ("" = standalone task)
+  goalId        String   @default("")
+  /// JSON: plan-gap detection results (missing prerequisites found by the verifier)
+  planGaps      String   @default("[]")
+  /// why the task is BLOCKED (missing credential/dependency) — shown in the UI
+  blockedReason String   @default("")
+  /// Jarvis #2: 'screen' = the vision loop (screenshot → model → one action),
+  /// '' (default) = the normal workspace task engine
+  mode          String   @default("")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  steps         AgenticStep[]
+  messages      AgentMessage[]
+  eventRows     AgentEvent[]
+}
+
+/// A single agent-to-agent message. Sender, receiver, task id and the
+/// correlation id are persisted so a conversation can be replayed exactly.
+model AgentMessage {
+  id             String      @id @default(cuid())
+  taskId         String
+  task           AgenticTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  conversationId String
+  seq            Int
+  fromAgent      String
+  toAgent        String
+  type           String      @default("task") // task | result | question | review | error
+  correlationId  String
+  content        String
+  provider       String      @default("")
+  model          String      @default("")
+  metadata       String      @default("{}") // JSON metadata (never contains secrets)
+  createdAt      DateTime    @default(now())
+
+  @@unique([taskId, seq])
+  @@index([taskId, conversationId, seq])
+  @@index([correlationId])
+}
+
+/// Persisted realtime event. `seq` is monotonic per task and is used as the
+/// SSE event id so a client can resume with `Last-Event-ID`.
+model AgentEvent {
+  id        String      @id @default(cuid())
+  taskId    String
+  task      AgenticTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  seq       Int
+  type      String
+  at        String
+  stepIndex Int?
+  payload   String      @default("{}") // JSON AgenticEvent.data
+  createdAt DateTime    @default(now())
+
+  @@unique([taskId, seq])
+  @@index([taskId, seq])
+}
+
+model AgenticStep {
+  id           String   @id @default(cuid())
+  taskId       String
+  task         AgenticTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  index        Int
+  kind         String   @default("implement") // analyze | implement | test | review | fix | command
+  title        String
+  description  String   @default("")
+  status       String   @default("pending") // pending | running | awaiting_approval | passed | failed | denied | skipped
+  attempts     Int      @default(0)
+  logs         String   @default("[]") // JSON: step log entries
+  filesChanged String   @default("[]") // JSON: string[]
+  commands     String   @default("[]") // JSON: {command, exitCode, output}[]
+  testResult   String? // pass | fail | error
+  reviewVerdict String? // pass | fail
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail — every privileged action is recorded with actor, task, action
+// type, approval status and result. Secrets are redacted before they get here.
+// ---------------------------------------------------------------------------
+model AuditLog {
+  id            String   @id @default(cuid())
+  at            DateTime @default(now())
+  actor         String   @default("user") // user | agent:<role> | system
+  agentId       String   @default("")
+  taskId        String   @default("")
+  action        String // e.g. task.run, provider.update, approval.deny
+  category      String   @default("general") // security | provider | task | tool | automation | memory | knowledge
+  approval      String   @default("") // auto | approved | denied | n/a
+  result        String   @default("ok") // ok | error
+  errorCategory String   @default("")
+  artifact      String   @default("") // JSON: artifact references
+  details       String   @default("{}") // JSON: redacted details
+  ip            String   @default("")
+
+  @@index([at])
+  @@index([taskId])
+  @@index([category])
+  @@index([action])
+}
+
+// ---------------------------------------------------------------------------
+// Server-side provider configuration. The API key is stored ENCRYPTED and is
+// never returned to the browser — only a `keyHint` (last 4 characters).
+// ---------------------------------------------------------------------------
+model ProviderConfig {
+  id           String    @id @default(cuid())
+  provider     String    @unique
+  label        String    @default("")
+  enabled      Boolean   @default(true)
+  priority     Int       @default(100) // lower number = tried first
+  baseUrl      String    @default("")
+  model        String    @default("")
+  timeoutMs    Int       @default(120000)
+  maxRetries   Int       @default(2)
+  costClass    String    @default("unknown") // free | paid | unknown
+  apiKeyEnc    String    @default("") // AES-256-GCM ciphertext (never leaves the server)
+  keyHint      String    @default("") // last 4 chars, safe to show
+  lastTestedAt DateTime?
+  lastTestOk   Boolean?
+  lastError    String    @default("")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+/// Key/value studio settings (free-only mode, default model, auto fallback).
+model StudioSetting {
+  key       String   @id
+  value     String   @default("")
+  updatedAt DateTime @updatedAt
+}
+
+/// Per-agent-role model preference (planner / coder / tester / reviewer / ...).
+model ModelPreference {
+  id        String   @id @default(cuid())
+  role      String   @unique
+  provider  String   @default("")
+  model     String   @default("")
+  enabled   Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Memory — persistent user preferences are kept apart from task-scoped notes.
+// ---------------------------------------------------------------------------
+model MemoryEntry {
+  id        String   @id @default(cuid())
+  scope     String   @default("user") // user | task
+  taskId    String   @default("")
+  category  String   @default("general") // preference | fact | note
+  key       String
+  content   String
+  source    String   @default("user") // user | agent
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scope, taskId, key])
+  @@index([scope, taskId])
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge / RAG — imported documents plus their searchable chunks.
+// ---------------------------------------------------------------------------
+model KnowledgeDoc {
+  id         String          @id @default(cuid())
+  name       String
+  path       String          @default("")
+  mime       String          @default("")
+  size       Int             @default(0)
+  status     String          @default("pending") // pending | indexed | failed | unsupported
+  error      String          @default("")
+  chunkCount Int             @default(0)
+  taskId     String          @default("")
+  /// where the document came from: paste | workspace | project
+  source     String          @default("paste")
+  /// absolute project root — only set for project indexes
+  sourceRoot String          @default("")
+  /// mtime (ms) of the file at index time — used to detect a stale index
+  sourceMtime Float          @default(0)
+  /// size of the file at index time — used to detect a stale index
+  sourceSize  Int            @default(0)
+  /// JSON array of the symbols found in the file (name/kind/line)
+  symbols     String         @default("[]")
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  chunks     KnowledgeChunk[]
+
+  @@index([source, sourceRoot])
+}
+
+model KnowledgeChunk {
+  id      String       @id @default(cuid())
+  docId   String
+  doc     KnowledgeDoc @relation(fields: [docId], references: [id], onDelete: Cascade)
+  seq     Int
+  content String
+
+  @@index([docId, seq])
+}
+
+// ---------------------------------------------------------------------------
+// Automation — explicit schedules with persisted runs.
+// A schedule fires either on a fixed INTERVAL (intervalMs) or on a CRON
+// expression (cronExpr). Timezone-aware, with a misfire policy for runs the
+// server missed while it was down.
+// ---------------------------------------------------------------------------
+model AutomationSchedule {
+  id         String          @id @default(cuid())
+  name       String
+  prompt     String
+  intervalMs Int             @default(3600000)
+  /// cron expression (5 fields: min hour dom month dow). When set it wins
+  /// over intervalMs. "" = use the fixed interval.
+  cronExpr   String          @default("")
+  /// IANA timezone the cron expression is evaluated in ("" = server local)
+  timezone   String          @default("")
+  /// what to do with runs missed while the server was down:
+  /// skip (default) | run_once | catch_up (bounded to the last 5)
+  misfirePolicy String       @default("skip")
+  enabled    Boolean         @default(false)
+  provider   String          @default("")
+  model      String          @default("")
+  lastRunAt  DateTime?
+  nextRunAt  DateTime?
+  lastStatus String          @default("")
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  runs       AutomationRun[]
+}
+
+model AutomationRun {
+  id         String            @id @default(cuid())
+  scheduleId String
+  schedule   AutomationSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  taskId     String            @default("")
+  startedAt  DateTime          @default(now())
+  finishedAt DateTime?
+  status     String            @default("running") // running | done | failed | skipped
+  error      String            @default("")
+  result     String            @default("")
+  /// how this run was triggered: schedule | manual | catch_up
+  trigger    String            @default("schedule")
+
+  @@index([scheduleId, startedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications — user-facing messages from the background runtime: task
+// finished/failed, approvals needed, automation results, suggestions.
+// ---------------------------------------------------------------------------
+model Notification {
+  id        String   @id @default(cuid())
+  /// task_done | task_failed | approval_required | automation | suggestion | system | browser
+  type      String   @default("system")
+  title     String
+  body      String   @default("")
+  taskId    String   @default("")
+  scheduleId String  @default("")
+  /// JSON: type-specific payload (e.g. suggestion id, run summary)
+  data      String   @default("{}")
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([read, createdAt])
+  @@index([taskId])
+}
+
+// ---------------------------------------------------------------------------
+// Goals — a long-running objective that groups many tasks. A goal survives
+// server restarts; each task keeps its own workspace and retry budget while
+// the goal tracks overall progress.
+// ---------------------------------------------------------------------------
+model Goal {
+  id          String   @id @default(cuid())
+  title       String
+  description String   @default("")
+  /// active | completed | abandoned
+  status      String   @default("active")
+  /// JSON: TaskConfig-level overrides for goal tasks (higher limits)
+  config      String   @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Custom tools — SELF-BUILT tools the agent proposed and the user approved.
+// The code is stored, versioned and executed with the SAME permission system
+// as the built-in tools; a custom tool never gets production credentials.
+// ---------------------------------------------------------------------------
+model CustomTool {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  description  String   @default("")
+  /// adapter | custom (mirrors ToolDefinition.category)
+  category     String   @default("custom")
+  /// JSON: zod-style param schema (name, type, required, description)
+  paramsSchema String   @default("[]")
+  /// safe | review | destructive — the LEAST permission the tool needs
+  permission   String   @default("review")
+  /// the tool implementation (a JS function body, validated + sandboxed)
+  code         String
+  /// draft | pending_approval | active | disabled | rejected
+  status       String   @default("draft")
+  version      Int      @default(1)
+  createdBy    String   @default("agent")
+  approvedBy   String   @default("")
+  invokeCount  Int      @default(0)
+  lastInvokedAt DateTime?
+  lastError    String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Proactive suggestions — the runtime analyses task history/events and
+// PROPOSES actions; the user accepts (→ a task is created) or dismisses.
+// ---------------------------------------------------------------------------
+model ProactiveSuggestion {
+  id          String   @id @default(cuid())
+  /// recurring_check | docs_update | failed_schedule | follow_up | cleanup
+  kind        String
+  title       String
+  body        String   @default("")
+  /// JSON: the evidence the suggestion is based on (task ids, counts, ...)
+  evidence    String   @default("{}")
+  /// the task prompt that is created when the user ACCEPTS the suggestion
+  actionPrompt String  @default("")
+  /// open | accepted | dismissed
+  status      String   @default("open")
+  taskId      String   @default("")
+  createdAt   DateTime @default(now())
+  decidedAt   DateTime?
+
+  @@index([status, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Prompt versions — the self-improvement loop stores every proposed change to
+// a role's system prompt as a version; activation and rollback are explicit,
+// audited, user-approved actions.
+// ---------------------------------------------------------------------------
+model PromptVersion {
+  id        String   @id @default(cuid())
+  /// which role this prompt belongs to (planner | coder | tester | ...)
+  role      String
+  content   String
+  version   Int      @default(1)
+  /// pending | active | rolled_back | rejected
+  status    String   @default("pending")
+  /// what motivated the change (observed failure, user request, ...)
+  rationale String   @default("")
+  createdBy String   @default("agent")
+  approvedBy String   @default("")
+  createdAt DateTime @default(now())
+  decidedAt DateTime?
+
+  @@index([role, status])
+}
+
+// ---------------------------------------------------------------------------
+// Browser sessions — one row per agent-controlled browser context. The
+// screenshots live on disk under the workspace; the row holds the state the
+// takeover/resume flow needs.
+// ---------------------------------------------------------------------------
+model BrowserSession {
+  id        String   @id @default(cuid())
+  taskId    String   @default("")
+  /// idle | navigating | acting | paused | closed
+  status    String   @default("idle")
+  currentUrl String  @default("")
+  pageTitle String   @default("")
+  /// path of the latest screenshot (relative to the studio root)
+  lastScreenshot String @default("")
+  /// JSON: detected form/checkout structure of the current page
+  pageIntel String   @default("{}")
+  /// JSON: queued actions waiting when the user took over
+  pendingActions String @default("[]")
+  /// true while the USER holds the browser (agent actions are refused)
+  userHold  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([taskId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Jarvis #7 — external connectors (Google Calendar, Gmail, ...).
+// Tokens are AES-256-GCM encrypted with AGENTSCOPE_SECRET_KEY (crypto.ts)
+// and NEVER returned to the client — only status + hints.
+// ---------------------------------------------------------------------------
+model ConnectorToken {
+  id             String    @id @default(cuid())
+  /// 'google' (one Google account per connector for now)
+  connector      String    @unique
+  accountEmail   String    @default("")
+  scopes         String    @default("")
+  accessTokenEnc String    @default("")
+  refreshTokenEnc String   @default("")
+  expiryAt       DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Jarvis #5 — proactive engine state (last morning-summary run, muted
+// suggestion kinds, daily counters). Tiny key/value store, no migrations.
+// ---------------------------------------------------------------------------
+model ProactiveState {
+  key       String   @id
+  value     String   @default("")
+  updatedAt DateTime @updatedAt
+}

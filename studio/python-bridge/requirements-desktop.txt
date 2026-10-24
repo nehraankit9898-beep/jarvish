@@ -1,0 +1,17 @@
+# AgentScope Studio — laptop-control desktop bridge (optional, opt-in)
+# Install:  pip install -r python-bridge/requirements-desktop.txt
+# Sirf desktop tools (mouse/keyboard/screen) ke liye chahiye.
+# Bridge bina in packages ke bhi start hota hai — har tool apna hint deta hai.
+
+pyautogui>=0.9.54      # mouse, keyboard, hotkeys, volume media-keys
+mss>=9.0.1             # fast screen capture (screenshots)
+pygetwindow>=0.0.9     # list/focus app windows (Windows/macOS)
+Send2Trash>=1.8.2      # delete -> Recycle Bin (kabhi permanent delete nahi)
+
+# OPTIONAL — global kill hotkey listener (Ctrl+Shift+F12 by default).
+# Install nahi kiya to sirf hotkey band rehta hai; UI/Telegram kill button kaam karta hai.
+# keyboard>=0.13.5
+
+# Jarvis extras (optional — har tool apna install hint deta hai)
+psutil>=5.9            # system_info: CPU / RAM / battery
+opencv-python>=4.9     # webcam_capture + screen_record (numpy saath aata hai)

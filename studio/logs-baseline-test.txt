@@ -1,0 +1,12 @@
+﻿bun test v1.4.2 (744846f84)
+bun : 
+At line:4 char:1
++ bun test 2>&1 | Out-File -FilePath "logs-baseline-test.txt" -Encoding ...
++ ~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ 212 pass
+ 0 fail
+ 642 expect() calls
+Ran 212 tests across 13 files. [29.29s]
