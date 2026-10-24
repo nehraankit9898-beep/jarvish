@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 /**
  * Simple in-memory fixed-window rate limiter for API routes.
- * Keyed by (ip, route). Suitable for single-instance deploys; for multi-node
+ * Keyed by (ip, route, limit bucket). Suitable for single-instance deploys; for multi-node
  * production deploys, back this with Redis.
  *
  * Limits:
@@ -28,18 +28,18 @@ function getIp(req: NextRequest): string {
   return req.headers.get('x-real-ip') || 'unknown';
 }
 
-function limitFor(req: NextRequest): { max: number; windowMs: number } {
+function limitFor(req: NextRequest): { max: number; windowMs: number; bucket: string } {
   const url = req.nextUrl.pathname;
   for (const [key, limit] of Object.entries(LIMITS)) {
-    if (key !== 'mutating' && key !== 'read' && url.startsWith(key)) {
-      return limit;
+    if (key !== 'mutating' && key !== 'read' && (url === key || url.startsWith(`${key}/`))) {
+      return { ...limit, bucket: key };
     }
   }
   const method = req.method.toUpperCase();
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
-    return LIMITS.read;
+    return { ...LIMITS.read, bucket: 'read' };
   }
-  return LIMITS.mutating;
+  return { ...LIMITS.mutating, bucket: 'mutating' };
 }
 
 /**
@@ -54,23 +54,22 @@ export function proxy(req: NextRequest) {
   }
 
   const ip = getIp(req);
-  const { max, windowMs } = limitFor(req);
-  const key = `${ip}:${url}`;
+  const { max, windowMs, bucket } = limitFor(req);
+  const key = `${ip}:${url}:${bucket}`;
   const now = Date.now();
   let win = stores.get(key);
-  if (!win || now > win.resetAt) {
+  if (!win || now >= win.resetAt) {
     win = { count: 0, resetAt: now + windowMs };
     stores.set(key, win);
   }
   win.count += 1;
-  if (win.count > max) {
-    return NextResponse.json(
-      { error: 'Too many requests. Please slow down.' },
-      { status: 429 }
-    );
+  const limited = win.count > max;
+  const res = limited
+    ? NextResponse.json({ error: 'Too many requests. Please slow down.' }, { status: 429 })
+    : NextResponse.next();
+  if (limited) {
+    res.headers.set('Retry-After', String(Math.max(1, Math.ceil((win.resetAt - now) / 1000))));
   }
-
-  const res = NextResponse.next();
   res.headers.set('X-RateLimit-Limit', String(max));
   res.headers.set('X-RateLimit-Remaining', String(Math.max(0, max - win.count)));
   res.headers.set('X-RateLimit-Reset', String(Math.ceil(win.resetAt / 1000)));

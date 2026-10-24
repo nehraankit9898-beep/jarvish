@@ -256,28 +256,40 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
   const [voiceBridgeReady, setVoiceBridgeReady] = useState<boolean | null>(null);
   const [audit, setAudit] = useState<AuditRow[]>([]);
 
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [lastChecked, setLastChecked] = useState<string | null>(null);
+
   const refreshSystem = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [s, h] = await Promise.all([
-        fetch('/api/system/status', { signal }).then((r) => (r.ok ? r.json() : null)),
-        fetch('/api/health', { signal }).then((r) => (r.ok ? r.json() : null)),
-      ]);
-      if (s) setSystem(s as SystemSnapshot);
-      if (h) setHealth(h as HealthSnapshot);
+      const res = await fetch('/api/health', { signal, cache: 'no-store' });
+      const h = await res.json() as HealthSnapshot;
+      setHealth(h);
+      setLastChecked(new Date().toLocaleTimeString());
+      setConnectionError(res.ok ? null : 'Database unavailable. Check server configuration.');
+      const snapshot = await fetch('/api/system/status', { signal, cache: 'no-store' });
+      if (snapshot.ok) setSystem(await snapshot.json() as SystemSnapshot);
+      else {
+        setSystem(null);
+        setConnectionError(snapshot.status === 401 || snapshot.status === 403
+          ? 'API access denied. Add your server access token in Settings.'
+          : 'System diagnostics unavailable. Check server logs.');
+      }
     } catch {
-      /* keep last snapshot */
+      if (signal?.aborted) return;
+      setHealth(null);
+      setSystem(null);
+      setConnectionError('Server unreachable. Check your connection; retrying automatically.');
     }
   }, []);
 
   const refreshProviders = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/providers', { signal });
-      if (res.ok) {
-        const data = (await res.json()) as { providers?: ProviderDto[] };
-        setProviders(data.providers ?? []);
-      }
+      const res = await fetch('/api/providers', { signal, cache: 'no-store' });
+      if (!res.ok) { setProviders([]); return; }
+      const data = (await res.json()) as { providers?: ProviderDto[] };
+      setProviders(data.providers ?? []);
     } catch {
-      /* keep last */
+      if (!signal?.aborted) setProviders([]);
     }
   }, []);
 
@@ -540,10 +552,10 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
   const uplink = useMemo(() => {
     const enabled = providers.filter((p) => p.enabled);
     const tested = enabled.filter((p) => p.lastTestOk === true).length;
-    const withKey = enabled.filter((p) => p.hasKey || p.provider === 'zai' || p.provider === 'ollama');
     return {
       enabled,
-      pct: enabled.length ? Math.round((Math.max(tested, withKey.length) / enabled.length) * 100) : 0,
+      tested,
+      pct: enabled.length ? Math.round((tested / enabled.length) * 100) : 0,
       configured: enabled.filter((p) => p.configured).length,
     };
   }, [providers]);
@@ -578,6 +590,7 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
       {/* ---------- reactor backdrop ---------- */}
       <div className="absolute inset-0 pointer-events-none" aria-hidden>
         <JarvisReactor state={state} className="absolute inset-0" />
+        <div className="absolute inset-0 jv-command-grid" />
         <div className="absolute inset-0 jv-scanlines" />
         <div className="absolute inset-0 jv-vignette" />
       </div>
@@ -589,7 +602,7 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
           <div className="relative flex-1 min-h-[300px] sm:min-h-[360px] flex flex-col items-center justify-end pointer-events-none">
             {/* left stats rail (desktop) */}
             <div className="hidden lg:flex flex-col gap-3 absolute left-5 top-5 w-44 pointer-events-auto">
-              <Meter label="UPLINK" value={uplink.pct} note={`${uplink.configured}/${uplink.enabled.length || providers.length} providers`} />
+              <Meter label="UPLINK" value={uplink.pct} note={`${uplink.tested}/${uplink.enabled.length} connection tests passed`} />
               <Meter
                 label="ENGINE"
                 value={pythonStatus?.ok ? 100 : pythonStatus?.python ? 40 : 0}
@@ -627,15 +640,15 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
                             ? 'bg-emerald-400'
                             : p.lastTestOk === false
                               ? 'bg-red-400'
-                              : p.hasKey || p.provider === 'zai' || p.provider === 'ollama'
-                                ? 'bg-cyan-400'
+                              : p.configured
+                                ? 'bg-amber-400'
                                 : 'bg-zinc-600'
                         }`}
                       />
                       <span className="truncate text-zinc-300">
                         {p.emoji} {p.name}
                       </span>
-                      <span className="ml-auto text-[10px] font-mono text-zinc-500 uppercase">{p.costClass}</span>
+                      <span className="ml-auto text-[10px] font-mono text-zinc-400 uppercase" title={p.lastError || "Last connection test result (not a live probe)"}>{p.lastTestOk === true ? "Test passed" : p.lastTestOk === false ? "Test failed" : "Not tested"}</span>
                     </li>
                   ))}
                   {!uplink.enabled.length && (
@@ -795,12 +808,29 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
               </div>
             )}
 
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono" role="status" aria-live="polite">
+              <span className={connectionError ? 'text-amber-300' : 'text-zinc-400'}>
+                {connectionError || (lastChecked ? `System checked ${lastChecked} · ${uplink.tested} provider tests passed` : 'Connecting to system…')}
+              </span>
+              <button type="button" onClick={() => { void refreshSystem(); void refreshProviders(); }} className="text-cyan-300 hover:underline">Refresh status</button>
+            </div>
             {/* transcript */}
             <div ref={logRef} className="jv-panel rounded-2xl px-3 pt-2 pb-1 max-h-52 overflow-y-auto">
               {messages.length === 0 && !streaming && (
-                <p className="text-[11px] text-zinc-500 font-mono py-2 text-center">
-                  Transcript empty — type a command below or say &quot;Hey JARVIS&quot;.
-                </p>
+                <div className="py-4 px-2">
+                  <p className="text-sm text-zinc-100">What can I help you with?</p>
+                  <p className="mt-1 text-xs text-zinc-400">Hindi or English. Type a command, or enable your microphone.</p>
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    {[
+                      ['Plan my day', 'Help me plan my day. Ask about my priorities first.'],
+                      ['Build something', 'Help me build an app. Ask me about the requirements first.'],
+                      ['Explain a concept', 'Mujhe AI agents simple Hindi mein samjhao.'],
+                    ].map(([label, prompt]) => (
+                      <button key={label} type="button" onClick={() => setInput(prompt)} className="rounded-lg border border-cyan-400/15 bg-cyan-400/5 p-3 text-left text-xs text-cyan-200 hover:bg-cyan-400/10 focus-visible:outline-2 focus-visible:outline-cyan-300">{label} ↗</button>
+                    ))}
+                  </div>
+                  {!uplink.tested && <button type="button" onClick={onOpenSettings} className="mt-3 text-xs text-amber-200 hover:underline">Connect and test an AI provider to enable real responses →</button>}
+                </div>
               )}
               <div className="space-y-2 py-1">
                 {messages.map((m, i) => (
@@ -854,14 +884,14 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
               className="mt-2 flex items-end gap-2 rounded-2xl border border-[var(--jv-panel-line)] bg-[rgba(4,12,20,0.86)] backdrop-blur p-2 focus-within:border-[var(--jv-accent-line)] transition-colors"
               onSubmit={(e) => {
                 e.preventDefault();
-                onSend();
+                if (!streaming && input.trim()) onSend();
               }}
             >
               <Textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
+                  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !streaming) {
                     e.preventDefault();
                     onSend();
                   }
@@ -922,7 +952,7 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
       <div className="xl:hidden lg:hidden absolute top-2 right-2 z-10 flex gap-1.5 pointer-events-none">
         <span className="jv-panel rounded-full px-2 py-1 text-[9px] font-mono text-zinc-400 pointer-events-auto" title="Enabled providers">
           <ActivityIcon className="h-3 w-3 inline mr-1 text-cyan-300" />
-          {uplink.enabled.length} up
+          {uplink.tested} tested
         </span>
         {hostPending.length > 0 && (
           <span className="jv-panel rounded-full px-2 py-1 text-[9px] font-mono text-amber-300">

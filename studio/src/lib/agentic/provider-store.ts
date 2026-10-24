@@ -1,3 +1,4 @@
+import { connectionSettingsChanged } from './provider-test-state';
 // provider-store.ts — SERVER-SIDE provider & model configuration.
 //
 // Until now the provider configuration lived only in the browser
@@ -351,8 +352,12 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderDt
     keyHint: hint,
   };
 
+  // Never keep a green (or red) test badge after editing the tested connection.
+  const testState = existing && connectionSettingsChanged(existing, data)
+    ? { lastTestOk: null, lastTestedAt: null, lastError: '' }
+    : {};
   const row = existing
-    ? await db.providerConfig.update({ where: { provider }, data })
+    ? await db.providerConfig.update({ where: { provider }, data: { ...data, ...testState } })
     : await db.providerConfig.create({ data: { provider, ...data } });
 
   return toDto(row);

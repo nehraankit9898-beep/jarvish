@@ -72,6 +72,17 @@ describe('secret storage', () => {
 });
 
 describe('provider configuration', () => {
+  test('editing connection settings clears a previously successful test', async () => {
+    await saveProvider({ provider: TEST_PROVIDER, model: 'old-model', baseUrl: 'https://api.example.com/v1' });
+    await recordConnectionResult(TEST_PROVIDER, true);
+    const unchanged = await saveProvider({ provider: TEST_PROVIDER, label: 'Renamed' });
+    expect(unchanged.lastTestOk).toBe(true);
+    const changed = await saveProvider({ provider: TEST_PROVIDER, model: 'new-model' });
+    expect(changed.lastTestOk).toBeNull();
+    expect(changed.lastTestedAt).toBeNull();
+    expect(changed.lastError).toBe('');
+  });
+
   test('stores a provider with an encrypted key and never returns it', async () => {
     const dto = await saveProvider({
       provider: TEST_PROVIDER,

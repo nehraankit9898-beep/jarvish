@@ -1,17 +1,11 @@
 import { NextRequest } from 'next/server';
+import { connectionRequestSchema } from '@/lib/connection-request';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { testProviderConnection } from '@/lib/agentic/provider-connection';
 import { recordAudit, clientIp } from '@/lib/agentic/audit';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
-
-interface TestBody {
-  provider: string;
-  apiKey?: string;
-  model?: string;
-  baseUrl?: string;
-}
 
 // Makes a REAL minimal request to the provider to verify the connection works.
 // The implementation lives in `provider-connection.ts` so that this route and
@@ -20,7 +14,15 @@ export async function POST(req: NextRequest) {
   const denied = rejectIfUnauthorized(req);
   if (denied) return denied;
   try {
-    const body = (await req.json()) as TestBody;
+    let raw: unknown;
+    try { raw = await req.json(); } catch {
+      return Response.json({ ok: false, error: 'Invalid JSON body', errorCategory: 'config' }, { status: 400 });
+    }
+    const parsed = connectionRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return Response.json({ ok: false, error: 'A valid provider and string connection settings are required', errorCategory: 'config' }, { status: 400 });
+    }
+    const body = parsed.data;
     const result = await testProviderConnection({
       provider: body.provider,
       apiKey: body.apiKey,

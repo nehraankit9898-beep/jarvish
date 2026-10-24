@@ -313,3 +313,25 @@
     animation: none;
   }
 }
+
+/* Bundled fonts: startup/build must not depend on Google Fonts access. */
+:root {
+  --font-geist-sans: 'Geist Variable', system-ui, sans-serif;
+  --font-geist-mono: 'Geist Mono Variable', monospace;
+  --font-orbitron: 'Orbitron', system-ui, sans-serif;
+}
+.jv-command-grid {
+  background-image: linear-gradient(rgba(34,211,238,.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34,211,238,.025) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at center, black, transparent 80%);
+}
+[data-jarvis-screen] { isolation: isolate; }
+[data-jarvis-screen] textarea { font-size: 16px; }
+@media (prefers-reduced-motion: reduce) {
+  .jarvis-scope *, .jarvis-scope *::before, .jarvis-scope *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

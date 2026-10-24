@@ -23,7 +23,7 @@ function arg(name, fallback) {
 }
 
 const port = String(arg('port', process.env.PORT || '3000'));
-const host = String(arg('host', process.env.HOSTNAME || '0.0.0.0'));
+const host = String(arg('host', '0.0.0.0'));
 
 const logPath = path.join(root, 'dev.log');
 const log = fs.createWriteStream(logPath, { flags: 'a' });
