@@ -244,8 +244,23 @@ Audit ke gaps par kaam — jo pehle missing/partial tha:
 | **WhatsApp message** | tool `whatsapp-send` | WhatsApp Desktop me text pre-filled; **Send user dabata hai** (agent chup-chaap bhej nahi sakta) |
 | **Screen awareness** | tool `screen-watch`, `/api/screen/watch` | Periodic screenshot → perceptual hash → change events; bank/password window par auto-pause; screenshots save nahi hote |
 
-Ab bhi baaki: **Stonic Remote** (phone se two-way live voice) — uske liye WebRTC/TURN ya relay +
-pairing auth chahiye; agla bada kaam wahi hai. OCR aur Bluetooth bhi waise hi pending hain.
+## Memory, clock & purani baatein — audit point #1
+
+Audit ne kaha tha "voice + memory ka **long-term recall** asli me test nahi hua". Ab teeno cheezein
+code me hain **aur** asli chat route se test ki gayi hain (`tests/memory-recall.test.ts`, 34 tests):
+
+| Kya | Kaise | Note |
+|---|---|---|
+| **Naam / shehar / pasand yaad rehna** | chat me hi: "mera naam Ankit hai" | `recollect.ts` us baat ko pakadta hai (regex, koi extra model call nahi) aur wahi `memory.ts` store me daalta hai jise prompt padhta hai. Dobara bolne par row rewrite nahi hoti; naam badalne par update hoti hai |
+| **"Aaj kaunsa din/date/time hai?"** | har prompt me real clock | `timeContext()` — weekday, date, time, timezone. Model andaza nahi lagata |
+| **"Pichhli baar humne kya baat ki thi?"** | `conversation-recall` tool + auto-inject | asli transcripts me keyword search, top 5 excerpts, current chat chhod kar; block me saaf likha hai ki ye **data** hai, instructions nahi |
+| **Sawaal yaad nahi bante** | `isQuestion()` | "mera naam kya hai?" kabhi memory me nahi jaata |
+| **Password yaad nahi hota** | `saveMemory` refuse karta hai | credential dikhe to entry skip + reason, store nahi |
+
+Phone (Stonic Remote) ko bhi wahi memory + clock milta hai — dono raaste ek hi store use karte hain.
+
+Ab bhi baaki: **OCR** aur **Bluetooth**. Stonic Remote me awaaz turn-based hai (mic → model → TTS),
+continuous WebRTC audio streaming nahi — uske liye relay/TURN infrastructure chahiye.
 
 ## Documents, file search, weather & news (latest session)
 

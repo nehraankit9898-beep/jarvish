@@ -5,6 +5,7 @@ import { registerBrowserTools } from '@/lib/agentic/browser-tools';
 import { registerHostTools } from '@/lib/agentic/host-tools';
 import { registerLaptopTools } from '@/lib/agentic/laptop-tools';
 import { registerMemoryTools } from '@/lib/agentic/memory-tools';
+import { registerRecollectTools } from '@/lib/agentic/recollect-tools';
 import { registerConnectorTools } from '@/lib/agentic/connector-tools';
 import { registerDocumentTools } from '@/lib/agentic/document-tools';
 import { registerInfoTools } from '@/lib/agentic/info-tools';
@@ -19,6 +20,7 @@ async function ensureFullCatalog() {
   registerHostTools();
   registerLaptopTools();
   registerMemoryTools();
+  registerRecollectTools();
   registerConnectorTools();
   registerDocumentTools();
   registerInfoTools();

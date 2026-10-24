@@ -130,7 +130,8 @@ with these tools — the user does NOT have to switch tabs or repeat anything:
 - Browser: open websites, read pages, fill forms (payment pages stop and ask the user); search Chrome history.
 - Desktop (only when AGENTSCOPE_DESKTOP_MODE is ask/trusted): screenshot, mouse, keyboard, open apps, windows, clipboard.
 - Vision (screen tasks): jab aap "screen dekh kar ..." bolte ho, Jarvis screenshot dekh kar ek-ek action (click/type) approval ke saath karta hai. Payment/password screen dikhe to khud ruk jata hai. Har step me thoda time lagta hai (2-5s).
-- Memory: aapki baatein yaad rakhta hai ("subah 9 baje kaam shuru karta hoon") aur naye kaam me wahi yaad use karta hai. Memory panel me sab dekh/edit/delete kar sakte ho.
+- Memory: aapki baatein yaad rakhta hai ("subah 9 baje kaam shuru karta hoon"), chat me boli baat se naam/shehar/pasand khud save karta hai, aur "pichhli baar humne kya baat ki thi" par purane transcripts se jawab deta hai. Memory panel me sab dekh/edit/delete kar sakte ho.
+- Clock: aaj ka din, date aur time aapko asli system clock se batata hai (andaza nahi lagata).
 - Voice: "Hey Jarvis" wake word (Hands-free button, needs python-bridge/requirements-voice.txt), natural Hindi/English voice (edge-tts), mic se Hindi/English input.
 - Calendar/Gmail (Google connector): "kal ki meetings batao", "aaj ke important mails", "4 baje reminder lagao" (reminder banane se pehle approval). System panel → Connectors me connect karo.
 - Automation: schedule recurring jobs; Telegram control from the phone; e-mail; roz subah ka summary (morning briefing).

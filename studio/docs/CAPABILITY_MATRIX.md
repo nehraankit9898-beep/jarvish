@@ -13,6 +13,9 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Voice me jawab | ✅ | edge-tts, Hindi voice |
 | Hindi/English baat-cheet | ✅ | LLM |
 | Context yaad rakhna / follow-up | ✅ | conversations + `memory.ts` |
+| Long-term memory (naam, shehar, pasand) | 🆕 | `recollect.ts` — chat me boli baat se fact nikal kar `memory.ts` me save, phir prompt me recall. Question yaad nahi banta, credential refuse |
+| "Aaj kaunsa din/date/time hai" | 🆕 | `timeContext()` — real clock (weekday, date, time, timezone) har prompt me + `time-now` tool |
+| Purani baatein yaad karna | 🆕 | `conversation-recall` tool + auto-inject on "pichhli baar…" — asli transcripts se top 5 excerpts |
 | Personality / tone set karna | ✅ | **Character** tab: 5 persona (JARVIS / F.R.I.D.A.Y / Buddy / Mentor / Studio), nickname, humour + reply-length sliders, language — server-side (`persona.ts`), chat prompt me jaata hai |
 | Male / female / animated character | ✅ | `jarvis-avatar.tsx` (SVG + CSS, gender variants, idle/listening/thinking/speaking states) |
 

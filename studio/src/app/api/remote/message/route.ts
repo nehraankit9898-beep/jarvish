@@ -13,6 +13,13 @@ import {
 } from '@/lib/agentic/remote-session';
 import { runRemoteTurn, historyFor, type Responder } from '@/lib/agentic/remote-chat';
 import { effectiveCredential, readStudioSettings } from '@/lib/agentic/provider-store';
+import { relevantMemoryContext } from '@/lib/agentic/memory';
+import {
+  captureFromUserTurn,
+  recallContext,
+  recallIntent,
+  timeContext,
+} from '@/lib/agentic/recollect';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -89,10 +96,23 @@ export async function POST(req: NextRequest) {
         { getProvider }
       );
 
+    // The phone channel gets the same long-term memory as the desktop: what the
+    // user said yesterday ("mera naam Ankit hai") plus the real clock.
+    let memoryBlock = '';
+    try {
+      const parts = [timeContext(), await relevantMemoryContext(text, 6)];
+      const intent = recallIntent(text);
+      if (intent.wanted) parts.push(await recallContext(intent.query || text));
+      memoryBlock = parts.filter(Boolean).join('\n\n');
+    } catch {
+      // memory must never break the phone call
+    }
+
     const { reply, spoken } = await runRemoteTurn({
       sessionId: session.id,
       text,
       responder,
+      memoryBlock,
       onUserTurn: () => {
         touch(session);
         countMessage(session);
@@ -100,6 +120,8 @@ export async function POST(req: NextRequest) {
     });
 
     await persistTurn(session, text, reply);
+    // facts stated over the phone are remembered too
+    await captureFromUserTurn(text, { source: 'remote' }).catch(() => undefined);
     await recordAudit({
       actor: 'remote',
       action: 'remote.message',

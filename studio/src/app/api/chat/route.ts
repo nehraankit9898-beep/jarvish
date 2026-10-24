@@ -16,6 +16,12 @@ import {
   readPersonaSettings,
 } from '@/lib/agentic/persona';
 import { relevantMemoryContext } from '@/lib/agentic/memory';
+import {
+  captureFromUserTurn,
+  recallContext,
+  recallIntent,
+  timeContext,
+} from '@/lib/agentic/recollect';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -78,6 +84,15 @@ export async function POST(req: NextRequest) {
       // the character layer must never break chat
     }
 
+    // The clock: a small local model has no idea what day it is, so "aaj
+    // kaunsa din hai" used to be a guess. The real date/time rides along.
+    try {
+      const clock = timeContext();
+      if (clock) systemPrompt += `\n\n${clock}`;
+    } catch {
+      // the clock must never break chat
+    }
+
     // "Ye kya kya kar sakta h?" — give the model the REAL feature list so a small
     // local model answers truthfully instead of with a generic greeting.
     if (isCapabilityQuestion(content)) {
@@ -118,10 +133,33 @@ Rules for this protocol:
       // memory retrieval must never break chat
     }
 
+    // "Pichhli baar humne kya baat ki thi?" — only when the user asks for it,
+    // pull the best matching excerpts out of the real transcripts.
+    try {
+      const intent = recallIntent(content);
+      if (intent.wanted) {
+        const recall = await recallContext(intent.query || content, {
+          excludeConversationId: conversationId,
+        });
+        if (recall) systemPrompt += `\n\n${recall}`;
+      }
+    } catch {
+      // recall must never break chat
+    }
+
     // Persist user message
     await db.message.create({
       data: { conversationId, role: 'user', content },
     });
+
+    // Long-term memory, written from what the user just SAID (no model call):
+    // "mera naam Ankit hai" now survives the conversation instead of waiting
+    // for an agent to decide to call memory-remember.
+    try {
+      await captureFromUserTurn(content, { source: 'chat' });
+    } catch {
+      // memory writes must never break chat
+    }
 
     // Build message history (last 40 messages, newest-first fetch)
     // NOTE: fetch DESC and reverse — `orderBy asc + take 40` would return the
