@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...but the SANITIZED example must be versioned (it documents every variable)
+!.env.example
 
 # vercel
 .vercel
@@ -46,8 +48,12 @@ local-*
 *.log
 dev.log
 dev.out.log
-test
-prompt
+# A bare `test` pattern matches ANY file or directory named `test` at any
+# depth, so git silently ignored real source: src/app/api/providers/[id]/test/
+# (the provider "Test connection" route) never made it into the repository or
+# an export archive. The scratch names are anchored to the project root instead.
+/test
+/prompt
 
 server.log
 # Skills directory

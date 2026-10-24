@@ -210,11 +210,23 @@ export async function getMemory(id: string): Promise<MemoryEntryDto | null> {
 
 /**
  * Delete memory entries.
- * Without an id the whole scope is cleared (the user asked for it).
+ *
+ * An id deletes ONE entry; otherwise a SCOPE must be named, which clears that
+ * scope (the user asked for it). A call with neither — `DELETE /api/memory`
+ * with no query string — used to fall through to `deleteMany({})` and wipe the
+ * user's preferences AND the private notes of EVERY task in one request. A
+ * mis-typed filter must never be able to do that, so an unscoped delete is now
+ * rejected instead of being silently broadened to "everything".
  */
 export async function deleteMemory(
   filter: { id?: string; scope?: MemoryScope; taskId?: string }
 ): Promise<number> {
+  if (!filter.id && filter.scope !== 'user' && filter.scope !== 'task') {
+    throw new MemoryValidationError(
+      'scope',
+      'Refusing to delete every memory entry — pass an id, or scope=user, or scope=task&taskId=…'
+    );
+  }
   if (filter.id) {
     const res = await db.memoryEntry.deleteMany({ where: { id: filter.id } });
     return res.count;

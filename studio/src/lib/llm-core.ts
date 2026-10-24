@@ -106,137 +106,126 @@ export interface LLMConfig {
  */
 type UpstreamRelease = () => void;
 
+/**
+ * ONE SSE reader for every provider.
+ *
+ * Each event is `data: <json>` on its own line. Two correctness rules that the
+ * three copy-pasted parsers used to get wrong:
+ *
+ *  1. THE LAST EVENT IS NOT ALWAYS NEWLINE-TERMINATED. The old code split the
+ *     buffer on "\n" and kept the tail in `buffer`; on EOF it closed the stream
+ *     and DISCARDED that tail. A provider that ends its response with
+ *     `data: {...}` and closes the socket (no trailing newline — OpenAI-compatible
+ *     gateways, some proxies and Gemini's alt=sse all do this) therefore lost
+ *     the final text of the reply, silently: the answer was cut off and nothing
+ *     reported an error. The remainder is now flushed through the same handler
+ *     at EOF.
+ *  2. `\r\n` line endings are handled (the trim below) and a `data:` line that
+ *     arrives in several TCP chunks is buffered until it is complete.
+ */
+function sseTextStream(
+  response: Response,
+  extract: (json: any) => string[],
+  release?: UpstreamRelease
+): ReadableStream<string> {
+  if (!response.body) {
+    throw new Error('The provider returned an empty stream');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let closed = false;
+
+  /** Feed one complete line; returns the text pieces to emit. */
+  const handleLine = (line: string): string[] => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return [];
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') return [];
+    try {
+      return extract(JSON.parse(data));
+    } catch {
+      // a keep-alive line, a comment, or a partial payload that the next block
+      // completes — never a reason to kill the stream
+      return [];
+    }
+  };
+
+  return new ReadableStream<string>({
+    async pull(controller) {
+      if (closed) return;
+      const { done, value } = await reader.read();
+      if (done) {
+        closed = true;
+        // flush the tail that never got its newline
+        if (buffer.trim()) {
+          for (const piece of handleLine(buffer)) {
+            if (piece) controller.enqueue(piece);
+          }
+          buffer = '';
+        }
+        controller.close();
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        for (const piece of handleLine(line)) {
+          if (piece) controller.enqueue(piece);
+        }
+      }
+    },
+    cancel() {
+      closed = true;
+      try {
+        void reader.cancel();
+      } catch {
+        /* already closed */
+      }
+      try {
+        release?.();
+      } catch {
+        /* ignore */
+      }
+    },
+  });
+}
+
+/** OpenAI-compatible (`choices[0].delta.content`, or a non-streaming message). */
 function sseChunksFromOpenAI(response: Response, release?: UpstreamRelease): ReadableStream<string> {
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  return new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        if (data === '[DONE]') continue;
-        try {
-          const json = JSON.parse(data);
-          const delta =
-            json.choices?.[0]?.delta?.content ??
-            json.choices?.[0]?.message?.content ??
-            '';
-          if (delta) controller.enqueue(delta as string);
-        } catch {
-          // partial JSON — ignore, next pull continues buffer
-        }
-      }
+  return sseTextStream(
+    response,
+    (json) => {
+      const delta =
+        json?.choices?.[0]?.delta?.content ??
+        json?.choices?.[0]?.message?.content ??
+        '';
+      return [typeof delta === 'string' ? delta : ''];
     },
-    cancel() {
-      try {
-        void reader.cancel();
-      } catch {
-        /* already closed */
-      }
-      try {
-        release?.();
-      } catch {
-        /* ignore */
-      }
-    },
-  });
+    release
+  );
 }
 
+/** Anthropic (`content_block_delta` → `delta.text`). */
 function sseChunksFromAnthropic(response: Response, release?: UpstreamRelease): ReadableStream<string> {
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  return new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        try {
-          const json = JSON.parse(data);
-          if (json.type === 'content_block_delta' && json.delta?.text) {
-            controller.enqueue(json.delta.text as string);
-          }
-        } catch {
-          // ignore partial
-        }
-      }
-    },
-    cancel() {
-      try {
-        void reader.cancel();
-      } catch {
-        /* already closed */
-      }
-      try {
-        release?.();
-      } catch {
-        /* ignore */
-      }
-    },
-  });
+  return sseTextStream(
+    response,
+    (json) => [json?.type === 'content_block_delta' && json?.delta?.text ? String(json.delta.text) : ''],
+    release
+  );
 }
 
+/** Gemini (`candidates[0].content.parts[].text`). */
 function sseChunksFromGemini(response: Response, release?: UpstreamRelease): ReadableStream<string> {
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  return new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        try {
-          const json = JSON.parse(data);
-          const parts = json.candidates?.[0]?.content?.parts ?? [];
-          for (const part of parts) {
-            if (part.text) controller.enqueue(part.text as string);
-          }
-        } catch {
-          // ignore partial
-        }
-      }
+  return sseTextStream(
+    response,
+    (json) => {
+      const parts = json?.candidates?.[0]?.content?.parts ?? [];
+      return Array.isArray(parts) ? parts.map((part: any) => (part?.text ? String(part.text) : '')) : [];
     },
-    cancel() {
-      try {
-        void reader.cancel();
-      } catch {
-        /* already closed */
-      }
-      try {
-        release?.();
-      } catch {
-        /* ignore */
-      }
-    },
-  });
+    release
+  );
 }
 
 async function* simulateStream(text: string) {

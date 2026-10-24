@@ -35,12 +35,14 @@ import { maybeMorningSummary } from './proactive';
 const TICK_MS = 30_000; // main loop — every 30 s
 const SUGGESTION_SCAN_MS = 10 * 60_000; // suggestions — every 10 min
 const NOTIFICATION_PRUNE_MS = 24 * 60 * 60_000; // prune — daily
+const RETENTION_SWEEP_MS = 24 * 60 * 60_000; // audit/message retention — daily
 const RETRY_DELAY_DEFAULT_MS = 60_000; // default retry_wait delay
 const ORPHAN_GRACE_MS = 2 * 60_000; // running task with no updates = orphan
 
 let ticker: ReturnType<typeof setInterval> | null = null;
 let suggestionTimer: ReturnType<typeof setInterval> | null = null;
 let pruneTimer: ReturnType<typeof setInterval> | null = null;
+let retentionTimer: ReturnType<typeof setInterval> | null = null;
 let startedAt: number | null = null;
 /** guards against overlapping ticks (a slow DB call must never pile up) */
 let ticking = false;
@@ -249,6 +251,38 @@ async function pruneOldNotifications(): Promise<void> {
 }
 
 /**
+ * Daily retention sweep for the audit trail and the agent transcript.
+ * A no-op unless AGENTSCOPE_RETENTION_DAYS is configured — and it never
+ * touches security audit rows or the records of a task that is still active
+ * (see retention.ts). The outcome is audit-logged so a cleanup is traceable.
+ */
+async function sweepRetention(): Promise<void> {
+  try {
+    const { pruneOldRecords, retentionPolicyFromEnv } = await import('./retention');
+    const policy = retentionPolicyFromEnv();
+    if (policy.days < 1) return;
+    const result = await pruneOldRecords(policy);
+    if (result.auditRemoved || result.agentMessagesRemoved || result.agentEventsRemoved) {
+      await recordAudit({
+        actor: 'system',
+        action: 'background.retention_sweep',
+        category: 'general',
+        approval: 'auto',
+        details: {
+          days: policy.days,
+          cutoff: result.cutoff ?? '',
+          auditRemoved: result.auditRemoved,
+          agentMessagesRemoved: result.agentMessagesRemoved,
+          agentEventsRemoved: result.agentEventsRemoved,
+        },
+      });
+    }
+  } catch (err) {
+    console.error('[background] retention sweep failed:', err instanceof Error ? err.message : err);
+  }
+}
+
+/**
  * Start the background runtime. Idempotent — calling it twice is a no-op
  * (Next.js dev-mode hot reloads would otherwise stack tickers).
  */
@@ -271,6 +305,10 @@ export function startBackgroundRuntime(): void {
   pruneTimer = setInterval(() => {
     void pruneOldNotifications();
   }, NOTIFICATION_PRUNE_MS);
+
+  retentionTimer = setInterval(() => {
+    void sweepRetention();
+  }, RETENTION_SWEEP_MS);
 
   // laptop-control (Roadmap #3/#9): Downloads watcher + Telegram bot.
   // Both are opt-in and fully optional — a failure here must never break
@@ -296,9 +334,11 @@ export function stopBackgroundRuntime(): void {
   if (ticker) clearInterval(ticker);
   if (suggestionTimer) clearInterval(suggestionTimer);
   if (pruneTimer) clearInterval(pruneTimer);
+  if (retentionTimer) clearInterval(retentionTimer);
   ticker = null;
   suggestionTimer = null;
   pruneTimer = null;
+  retentionTimer = null;
   startedAt = null;
   stopDownloadsWatcher();
   stopTelegramBot();

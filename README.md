@@ -282,7 +282,9 @@ Teen naye test files: `tests/documents.test.ts`, `tests/document-tools.test.ts`,
 
 ## Bug-fix update — 8 real bugs fixed (latest session)
 
-Poore project ka systematic bug audit: 2 HIGH (unsatisfiable-cron runaway cost loop, cancelled-task ka pending host-approval execute hona), 4 MEDIUM (silent morning-summary TTS, double morning summary non-UTC timezones me, vision null-coordinate click, tab-close par server-side mic leak), 2 LOW (Google OAuth login-CSRF, env-var NaN). Har fix ka regression test `tests/bugfix-regressions.test.ts` me — ab **773/773 tests pass**.
+Poore project ka systematic bug audit: 2 HIGH (unsatisfiable-cron runaway cost loop, cancelled-task ka pending host-approval execute hona), 4 MEDIUM (silent morning-summary TTS, double morning summary non-UTC timezones me, vision null-coordinate click, tab-close par server-side mic leak), 2 LOW (Google OAuth login-CSRF, env-var NaN). Har fix ka regression test `tests/bugfix-regressions.test.ts` me hai. (Test count ke liye
+neeche "Repair pass 2026-10" section dekho — wahi authoritative hai; yeh line purane
+snapshot ki thi.)
 
 Details + fix-by-fix explanation: **studio/docs/BUGFIXES.md**
 Pichhle session ke 7 Jarvis features ka guide: **studio/docs/JARVIS_FEATURES.md**
@@ -299,3 +301,42 @@ Setup (kuch naya install nahi):
 
 See [setup and verification notes](studio/docs/JARVIS_READINESS.md) for local setup,
 security, tested fixes, and remaining deployment requirements.
+
+## Repair pass 2026-10 — build, provider test route, retention (authoritative)
+
+Poore project ka independent audit + repair. 5 reports root me hain:
+
+| File | Kya hai |
+|---|---|
+| `BUG_AUDIT_REPORT.md` | har confirmed bug: reproduction, expected vs actual, root cause, fix, regression test |
+| `FIX_REPORT.md` | har badlaav file-by-file, reason + evidence |
+| `TEST_RESULTS.md` | har command jo actually chala, exit code, output tail, aur jo verify **nahi** hua |
+| `SECURITY_REPORT.md` | threat model, findings, remaining risks, hardening list |
+| `FEATURE_STATUS.md` | implemented / partial / blocked / missing — feature by feature |
+
+Sabse important 3 cheezein jo pehle tooti hui thi:
+
+1. **`npm run build` fail ho raha tha** (production bundle hi nahi banta tha) — Turbopack
+   `spawn(exe, ['--flag', …])` ke literal array ko module-specifier samajh raha tha. Ab build
+   `✓ Compiled successfully` deta hai. Iske bina koi installer/archive nahi ban sakta tha.
+2. **Provider ka "Test connection" button 404 de raha tha** — `POST /api/providers/[id]/test`
+   route hi maujood nahi tha (jabki `/api` index aur panel dono use karte hain). Ab route hai,
+   aur `.gitignore` ka bare `test` pattern bhi fix hua jo us route ko git/archive se chupa raha tha.
+3. **Chat replies truncate ho rahi thi** — teeno SSE parsers aakhri frame (jisme trailing newline
+   nahi hota) drop kar dete the. Ab ek hi reader hai jo EOF par buffer flush karta hai.
+
+Naya optional config: `AGENTSCOPE_RETENTION_DAYS` (default **0 = off**) audit rows / agent
+messages / streamed events ko N din baad prune karta hai — security audit rows aur chal rahe tasks
+ke records kabhi delete nahi hote. Poora list: `studio/.env.example`.
+
+Verification (dev server band karke — is sandbox me WASM adapter ek hi SQLite file par do writer
+nahi le sakta):
+
+```bash
+cd studio
+npm install && npm run setup
+npx tsc --noEmit      # 0 errors
+npx eslint .          # 0 errors, 42 warnings
+bun test              # 752 pass / 0 fail (45 files)
+npm run build         # success
+```
