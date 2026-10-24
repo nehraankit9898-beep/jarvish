@@ -1,12 +1,15 @@
 import { NextRequest } from 'next/server';
 import { db } from '@/lib/db';
-import { getProvider, resolveModel } from '@/lib/providers';
+import { getProvider, resolveModelWithNotice, modelNote } from '@/lib/providers';
 import {
   buildUpstreamStream,
   capHistoryContext,
   parseApiError,
   type CoreChatMessage,
 } from '@/lib/llm-core';
+import { buildProviderFailure, classifyHttpStatus, sanitizeProviderMessage } from '@/lib/provider-errors';
+import { effectiveCredential } from '@/lib/agentic/provider-store';
+import { recordLastError } from '@/lib/agentic/last-action-error';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { protect } from '@/lib/agentic/secrets';
 import { isCapabilityQuestion, JARVIS_CAPABILITIES_PROMPT } from '@/lib/agentic/jarvis';
@@ -189,8 +192,33 @@ Rules for this protocol:
     ];
 
     const temperature = body.temperature ?? 0.7;
-    // Purane/retired model (e.g. gemini-2.0-flash) ko current model par map karo
-    const usedModel = resolveModel(provider, body.model);
+
+    // ---- ONE source of truth for the credential -------------------------
+    // The browser used to be the only place a key lived, so a key saved in
+    // the Providers panel (server-side, encrypted) was invisible to chat and
+    // the user was told "Gemini API key is required" while a valid key was
+    // already stored on the very same server. The request-supplied credential
+    // still wins (nothing that worked before changes), then the encrypted
+    // server-side store, then the environment.
+    let apiKey = body.apiKey?.trim() || '';
+    let baseUrl = body.baseUrl?.trim() || '';
+    if (!apiKey || !baseUrl) {
+      try {
+        const stored = await effectiveCredential(providerId, {
+          apiKey: body.apiKey,
+          baseUrl: body.baseUrl,
+        });
+        apiKey = apiKey || stored.apiKey;
+        baseUrl = baseUrl || stored.baseUrl;
+      } catch {
+        // no database / no stored credential — the request value is all we have
+      }
+    }
+
+    // A retired model id is replaced WITH a notice (never silently).
+    const resolvedModel = resolveModelWithNotice(provider, body.model);
+    const usedModel = resolvedModel.model;
+    const modelNotice = resolvedModel.notice;
 
     // ---- Connect for real (via shared llm-core layer) ----
     // The request signal is forwarded: the user's Stop button aborts the
@@ -204,9 +232,9 @@ Rules for this protocol:
     try {
       upstream = await buildUpstreamStream(messages, {
         provider: providerId,
-        apiKey: body.apiKey,
+        apiKey: apiKey || undefined,
         model: usedModel,
-        baseUrl: body.baseUrl,
+        baseUrl: baseUrl || undefined,
         temperature,
         signal: req.signal,
       }, { getProvider });
@@ -215,9 +243,21 @@ Rules for this protocol:
       // "rate limited, retry in Ns" instead of a generic 502.
       const parsed = parseApiError(err);
       if (parsed.status === 429) {
+        const limited = buildProviderFailure({
+          category: 'rate_limit',
+          status: 429,
+          detail: '',
+          retryAfterSec: parsed.retryAfterSec,
+          providerName: provider.name,
+          model: usedModel,
+        });
         return new Response(
           JSON.stringify({
-            error: 'Provider rate limit reached.',
+            error: limited.message,
+            errorCategory: limited.category,
+            hint: limited.hint,
+            provider: providerId,
+            model: usedModel,
             retryAfterSec: parsed.retryAfterSec,
           }),
           {
@@ -237,54 +277,72 @@ Rules for this protocol:
       }
       console.error('[chat] upstream connection failed:', err);
 
-      // NAME THE ACTUAL FAILURE. Everything used to collapse into
-      // "Unable to reach the model provider" with a 502 — including a 401 for a
-      // wrong API key, a 404 for a retired model and a provider 5xx. The user
-      // was told the network was down while the provider was answering
-      // perfectly well, and the fix (rotate the key / pick another model) was
-      // never suggested. Provider status is mapped back to the caller; the
-      // provider's own body is masked before it can reach the browser.
-      const providerText = protect(
-        err instanceof Error ? err.message : 'unknown error'
-      ).masked.slice(0, 300);
-      const failure = (status: number, error: string, errorCategory: string) =>
-        new Response(
-          JSON.stringify({ error, errorCategory, provider: providerId, model: usedModel }),
-          {
-            status,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        );
-      if (parsed.status === 401 || parsed.status === 403) {
-        return failure(
-          401,
-          `The provider rejected the API key (${parsed.status}). Check the key for "${providerId}" in Settings → API.`,
-          'auth'
-        );
-      }
-      if (parsed.status === 404) {
-        return failure(
-          404,
-          `The provider does not offer the model "${usedModel}". Pick another model in Settings → API.`,
-          'config'
-        );
-      }
-      if (parsed.status === 400 || parsed.status === 422) {
-        return failure(400, `The provider rejected the request: ${providerText}`, 'config');
-      }
-      if (typeof parsed.status === 'number' && parsed.status >= 500) {
-        return failure(502, `The provider is failing (HTTP ${parsed.status}). Try again shortly.`, 'server');
-      }
-      return failure(
-        502,
-        `Unable to reach the model provider (${providerText}).`,
-        'network'
+      // NAME THE ACTUAL FAILURE through ONE shared classifier.
+      // (Previously: every non-429 failure collapsed into "network", so a 401
+      // for a wrong key was reported as "no internet", and a 404 for a
+      // retired model never suggested picking another model.)
+      const raw = err instanceof Error ? err.message : String(err ?? 'unknown error');
+      const keyless = protect(raw).masked;
+      const category = parsed.status
+        ? classifyHttpStatus(parsed.status)
+        : /timeout|aborted|timed out/i.test(raw)
+          ? 'timeout'
+          : /fetch failed|enotfound|econnrefused|eai_again|network|socket/i.test(raw)
+            ? 'network'
+            : 'unknown';
+      const built = buildProviderFailure({
+        category,
+        status: parsed.status,
+        detail: keyless.replace(/^API error \d{3}(?: \[retry-after=[^\]]+\])?:\s*/i, ''),
+        secrets: apiKey ? [apiKey] : [],
+        retryAfterSec: parsed.retryAfterSec,
+        providerName: provider.name,
+        model: usedModel,
+      });
+      recordLastError({
+        what: `${provider.name} chat (${usedModel})`,
+        category: built.category,
+        message: built.message,
+        hint: built.hint,
+        secrets: apiKey ? [apiKey] : [],
+      });
+      const httpStatus =
+        category === 'auth'
+          ? 401
+          : category === 'model_unavailable'
+            ? 404
+            : category === 'config'
+              ? 400
+              : category === 'timeout'
+                ? 504
+                : category === 'server'
+                  ? 502
+                  : 502;
+      return new Response(
+        JSON.stringify({
+          error: built.message,
+          errorCategory: built.category,
+          hint: built.hint,
+          provider: providerId,
+          providerName: provider.name,
+          model: usedModel,
+          retryAfterSec: built.retryAfterSec,
+          checkedAt: built.at,
+        }),
+        {
+          status: httpStatus,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(modelNotice ? { 'X-Model-Notice': encodeURIComponent(modelNotice.reason) } : {}),
+          },
+        }
       );
     }
     const upstreamMs = Date.now() - upstreamOpenedAt;
 
     // ---- Wrap: stream to client while persisting full text ----
     let full = '';
+    let streamErrored = false;
     const decoder = new TextEncoder();
     const outStream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -299,8 +357,26 @@ Rules for this protocol:
         } catch (e) {
           // A user abort is not an error worth showing — the client is gone.
           if (!req.signal.aborted) {
+            streamErrored = true;
             const msg = e instanceof Error ? e.message : 'stream error';
-            controller.enqueue(decoder.encode(`\n\n[Stream error: ${msg}]`));
+            // Never echo raw provider text (it can carry proxy details or a
+            // key fragment) — sanitise it, and keep it short.
+            controller.enqueue(
+              decoder.encode(`\n\n[Stream error: ${sanitizeProviderMessage(msg)}]`)
+            );
+          }
+        }
+        // A reply with no text is a FAILURE, not a silent success: the user
+        // must be told why JARVIS said nothing (blocked / empty / upstream cut).
+        if (!full.trim() && !streamErrored && !req.signal.aborted) {
+          try {
+            controller.enqueue(
+              decoder.encode(
+                `⚠️ ${provider.name} ne khaali jawab bheja (model: ${usedModel}). Model ya key badal kar dekhiye.`
+              )
+            );
+          } catch {
+            /* stream already closed */
           }
         }
         try {
@@ -349,6 +425,10 @@ Rules for this protocol:
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no',
         'Server-Timing': `setup;dur=${setupMs}, upstream;dur=${upstreamMs}`,
+        ...(modelNotice ? { 'X-Model-Notice': encodeURIComponent(modelNotice.reason) } : {}),
+        ...(modelNote(provider, usedModel)
+          ? { 'X-Model-Note': encodeURIComponent(modelNote(provider, usedModel) as string) }
+          : {}),
       },
     });
   } catch (err) {

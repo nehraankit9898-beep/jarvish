@@ -6,8 +6,13 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { resolveModel } from './providers';
+import { resolveModelWithNotice, type ModelNotice } from './providers';
 import { assertOutboundUrl } from './agentic/outbound';
+import {
+  extractProviderErrorMessage,
+  sanitizeProviderMessage,
+  summarizeGeminiResponse,
+} from './provider-errors';
 
 export interface CoreChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -94,6 +99,12 @@ export interface LLMConfig {
    * connection as well.
    */
   signal?: AbortSignal;
+  /**
+   * Called once the model id has been resolved. When a retired id had to be
+   * replaced, `notice` is set — callers MUST report it (header, UI, voice)
+   * instead of silently answering with a different model.
+   */
+  onModelResolved?: (notice: ModelNotice | undefined) => void;
 }
 
 // ---------- SSE parsers (moved from chat route, unchanged logic) ----------
@@ -216,16 +227,99 @@ function sseChunksFromAnthropic(response: Response, release?: UpstreamRelease): 
   );
 }
 
-/** Gemini (`candidates[0].content.parts[].text`). */
+/**
+ * Gemini (`candidates[0].content.parts[].text`).
+ *
+ * Gemini reports safety blocks and quota problems INSIDE a HTTP 200 body
+ * (`promptFeedback.blockReason`, `finishReason: SAFETY`). The generic parser
+ * silently dropped those events, so a blocked reply looked like a successful
+ * empty answer: the chat bubble stayed blank, JARVIS said nothing and the UI
+ * reported success. The block reason is now tracked and surfaced.
+ */
 function sseChunksFromGemini(response: Response, release?: UpstreamRelease): ReadableStream<string> {
-  return sseTextStream(
-    response,
-    (json) => {
-      const parts = json?.candidates?.[0]?.content?.parts ?? [];
-      return Array.isArray(parts) ? parts.map((part: any) => (part?.text ? String(part.text) : '')) : [];
+  if (!response.body) throw new Error('The provider returned an empty stream');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let closed = false;
+  let emitted = 0;
+  let blockReason = '';
+  let finishReason = '';
+
+  const handle = (line: string): string[] => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return [];
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') return [];
+    let json: any;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      return [];
+    }
+    const summary = summarizeGeminiResponse(json);
+    if (summary.blockReason) blockReason = summary.blockReason;
+    if (summary.finishReason && summary.finishReason !== 'STOP') finishReason = summary.finishReason;
+    const parts = json?.candidates?.[0]?.content?.parts ?? [];
+    return Array.isArray(parts) ? parts.map((part: any) => (part?.text ? String(part.text) : '')) : [];
+  };
+
+  return new ReadableStream<string>({
+    async pull(controller) {
+      if (closed) return;
+      const { done, value } = await reader.read();
+      if (done) {
+        closed = true;
+        if (buffer.trim()) {
+          for (const piece of handle(buffer)) {
+            if (piece) {
+              emitted += piece.length;
+              controller.enqueue(piece);
+            }
+          }
+          buffer = '';
+        }
+        if (emitted === 0) {
+          // A 200 with no text is NOT a successful answer.
+          const status = blockReason ? 'blocked' : 'empty_response';
+          controller.error(
+            new Error(
+              `API error 200: Gemini returned no text (${blockReason ? `blockReason=${blockReason}` : 'empty response'}${
+                finishReason ? `, finishReason=${finishReason}` : ''
+              }) [category=${status}]`
+            )
+          );
+          return;
+        }
+        controller.close();
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        for (const piece of handle(line)) {
+          if (piece) {
+            emitted += piece.length;
+            controller.enqueue(piece);
+          }
+        }
+      }
     },
-    release
-  );
+    cancel() {
+      closed = true;
+      try {
+        void reader.cancel();
+      } catch {
+        /* already closed */
+      }
+      try {
+        release?.();
+      } catch {
+        /* ignore */
+      }
+    },
+  });
 }
 
 async function* simulateStream(text: string) {
@@ -316,8 +410,14 @@ export async function buildUpstreamStream(
   const provider = providers.getProvider(config.provider || 'zai');
   if (!provider) throw new Error(`Unknown provider: ${config.provider}`);
   const apiKey = config.apiKey?.trim() || '';
-  // Retired models (e.g. gemini-2.0-flash → gemini-3.8-flash) auto-map karo
-  const model = resolveModel(provider, config.model);
+  // A retired model id is replaced WITH a notice — never silently.
+  const resolved = resolveModelWithNotice(provider, config.model);
+  const model = resolved.model;
+  try {
+    config.onModelResolved?.(resolved.notice);
+  } catch {
+    /* a diagnostic callback must never break the request */
+  }
   let baseUrl = (config.baseUrl?.trim() || provider.baseUrl).replace(
     /\/+$/,
     ''
@@ -379,6 +479,13 @@ export async function buildUpstreamStream(
       headers: {
         'Content-Type': 'application/json',
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        // OpenRouter attribution headers (ignored by other gateways).
+        ...(provider.id === 'openrouter'
+          ? {
+              'HTTP-Referer': process.env.AGENTSCOPE_PUBLIC_URL || 'http://localhost:3000',
+              'X-Title': 'AgentScope Studio JARVIS',
+            }
+          : {}),
       },
       body: JSON.stringify({
         model,
@@ -493,7 +600,13 @@ export async function completeText(
 export function apiErrorMessage(res: Response, errText: string): string {
   const retryAfter = res.status === 429 ? res.headers.get('retry-after')?.trim() : '';
   const hint = retryAfter && /^\d+(\.\d+)?$/.test(retryAfter) ? ` [retry-after=${retryAfter}s]` : '';
-  return `API error ${res.status}${hint}: ${errText.slice(0, 300) || res.statusText}`;
+  // Providers return JSON ({error:{message}}), HTML proxy pages, or plain text.
+  // Only the useful part is kept, and any credential echoed back is redacted.
+  const detail =
+    sanitizeProviderMessage(extractProviderErrorMessage(errText)).slice(0, 300) ||
+    res.statusText ||
+    'request failed';
+  return `API error ${res.status}${hint}: ${detail}`;
 }
 
 export interface ParsedApiError {

@@ -102,6 +102,9 @@ export function JarvisSettings(props: JarvisSettingsProps) {
     onOpenProvidersPanel,
   } = props;
 
+  /* ---------- voice-test feedback ---------- */
+  const [voiceTest, setVoiceTest] = useState<'idle' | 'started' | 'failed'>('idle');
+
   /* ---------- AI BRAIN state ---------- */
   const [selProvider, setSelProvider] = useState<ProviderId>(activeProvider);
   const [draftKey, setDraftKey] = useState('');
@@ -412,13 +415,50 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                   size="sm"
                   variant="outline"
                   className="h-8 border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/10"
-                  disabled={!tts.supported}
-                  onClick={() => tts.speak('All systems online. I am listening.')}
+                  onClick={() => {
+                    // testVoice() bypasses the mute toggle and surfaces failures
+                    // through tts.error — it never silently does nothing.
+                    const started = tts.testVoice('All systems online. Main aapki awaaz sun raha hoon.');
+                    setVoiceTest(started ? 'started' : 'failed');
+                  }}
                 >
                   <Volume2 className="h-3.5 w-3.5 mr-1.5" /> Test voice
                 </Button>
-                {tts.speaking && <span className="text-[10px] font-mono text-cyan-300 jv-anim-blink">speaking…</span>}
+                {tts.speaking && (
+                  <span className="text-[10px] font-mono text-cyan-300 jv-anim-blink">speaking…</span>
+                )}
+                {voiceTest === 'started' && !tts.error && (
+                  <span className="text-[10px] font-mono text-emerald-300">sent to {tts.engine ?? 'voice engine'}</span>
+                )}
+                {voiceTest === 'failed' && !tts.error && (
+                  <span className="text-[10px] font-mono text-red-300">voice engine unavailable</span>
+                )}
               </div>
+              {tts.error && (
+                <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-2 flex items-start gap-2">
+                  <p className="flex-1 text-[11px] text-red-200 font-mono">🔇 {tts.error}</p>
+                  <button
+                    className="text-[10px] text-zinc-400 underline"
+                    onClick={() => {
+                      tts.clearError();
+                      setVoiceTest('idle');
+                    }}
+                  >
+                    dismiss
+                  </button>
+                </div>
+              )}
+              {tts.lastSpoken && (
+                <p className="text-[10px] text-zinc-500 leading-relaxed">
+                  Last spoken: <span className="text-zinc-300">“{tts.lastSpoken}”</span>
+                </p>
+              )}
+              {!tts.enabled && (
+                <p className="text-[10px] text-amber-400/90">
+                  Spoken replies are OFF. JARVIS will stay silent until you switch this on — Test voice
+                  still works while it is off.
+                </p>
+              )}
             </div>
 
             <div className="rounded-xl border border-[var(--jv-panel-line)] p-3 space-y-3">

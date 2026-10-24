@@ -2,6 +2,8 @@ import { NextRequest } from 'next/server';
 import { db } from '@/lib/db';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { detectIntent, isApprovalAffirmative, wantsScreenTask, MIN_TASK_PROMPT } from '@/lib/agentic/jarvis';
+import { parseOfflineCommand } from '@/lib/agentic/offline-commands';
+import { runOfflineCommand } from '@/lib/agentic/offline-runner';
 
 export const runtime = 'nodejs';
 
@@ -18,6 +20,16 @@ export const runtime = 'nodejs';
  *       Saves the user message and the assistant's acknowledgement in the
  *       conversation, so a message that became a task still shows up in the
  *       chat history (the /api/chat route is not involved for those).
+ *
+ *   { op: 'command', content, dryRun?: boolean }
+ *       → OfflineResult
+ *       Executes a DETERMINISTIC command (spec §7) with no cloud API at all:
+ *       open an allowlisted site/app, report status, repeat the last error,
+ *       cancel the running task, or print help. `dryRun: true` only PARSES
+ *       (the UI uses it to decide whether the offline path applies).
+ *       Anything unrecognised returns `{ matched: false }` so the caller can
+ *       fall back to the normal AI path — offline mode never pretends to
+ *       reason.
  */
 export async function POST(req: NextRequest) {
   const denied = rejectIfUnauthorized(req);
@@ -30,7 +42,28 @@ export async function POST(req: NextRequest) {
       conversationId?: string;
       userContent?: string;
       assistantContent?: string;
+      dryRun?: boolean;
     };
+
+    if (body.op === 'command') {
+      const content = String(body.content ?? '');
+      const parsed = parseOfflineCommand(content, { platform: process.platform });
+      if (!parsed.matched || !parsed.command) {
+        return Response.json({
+          matched: false,
+          reason: parsed.reason ?? 'not a deterministic offline command',
+        });
+      }
+      if (body.dryRun) {
+        return Response.json({
+          matched: true,
+          kind: parsed.command.kind,
+          label: parsed.label,
+        });
+      }
+      const result = await runOfflineCommand(parsed.command);
+      return Response.json({ matched: true, ...result });
+    }
 
     if (body.op === 'intent') {
       const content = body.content ?? '';
@@ -92,7 +125,10 @@ export async function POST(req: NextRequest) {
       return Response.json({ ok: true });
     }
 
-    return Response.json({ error: "op must be 'intent' or 'log'" }, { status: 400 });
+    return Response.json(
+      { error: "op must be 'intent', 'log' or 'command'" },
+      { status: 400 }
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Internal error';
     return Response.json({ error: message }, { status: 500 });

@@ -48,6 +48,34 @@ interface ProviderDto {
   configured: boolean;
 }
 
+interface ModelDto {
+  id: string;
+  free?: boolean;
+  chat?: boolean;
+  note?: string;
+  legacy?: boolean;
+}
+
+interface ModelListMeta {
+  source: 'provider' | 'cache' | 'catalog';
+  cached: boolean;
+  fetchedAt: string | null;
+  note?: string;
+  error?: string;
+  selected?: string;
+  selectedNotice?: string;
+}
+
+interface TestResult {
+  ok: boolean;
+  message?: string;
+  error?: string;
+  errorCategory?: string;
+  hint?: string;
+  model?: string;
+  at: string;
+}
+
 interface ModelPreference {
   role: string;
   provider: string;
@@ -83,6 +111,39 @@ const costBadge: Record<string, string> = {
   unknown: 'border-zinc-600 text-zinc-400',
 };
 
+const CATEGORY_LABEL: Record<string, string> = {
+  not_configured: 'Not configured',
+  auth: 'Authentication failed',
+  model_unavailable: 'Model unavailable',
+  rate_limit: 'Rate limited',
+  server: 'Provider server error',
+  network: 'Network unavailable',
+  timeout: 'Timed out',
+  blocked: 'Blocked by outbound policy',
+  empty_response: 'Empty response',
+  config: 'Configuration error',
+  unknown: 'Unknown error',
+};
+
+function statusLabel(category: string): string {
+  return CATEGORY_LABEL[category] ?? category;
+}
+
+/** "3 min ago" — keeps the timestamp readable without losing the exact time. */
+function relativeTime(iso: string | null): string {
+  if (!iso) return 'never';
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return 'never';
+  const diff = Date.now() - then;
+  if (diff < 0) return 'just now';
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
 export function ProvidersPanel() {
   const [providers, setProviders] = useState<ProviderDto[]>([]);
   const [order, setOrder] = useState<OrderRow[]>([]);
@@ -101,8 +162,10 @@ export function ProvidersPanel() {
   const [timeoutMs, setTimeoutMs] = useState(120000);
   const [maxRetries, setMaxRetries] = useState(2);
   const [costClass, setCostClass] = useState<'free' | 'paid' | 'unknown'>('unknown');
-  const [models, setModels] = useState<{ id: string; free?: boolean }[]>([]);
+  const [models, setModels] = useState<ModelDto[]>([]);
+  const [modelMeta, setModelMeta] = useState<ModelListMeta | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -148,6 +211,8 @@ export function ProvidersPanel() {
     setMaxRetries(current.maxRetries);
     setCostClass(current.costClass);
     setModels([]);
+    setModelMeta(null);
+    setTestResult(null);
   }, [current?.provider]);
 
   const save = useCallback(async () => {
@@ -226,6 +291,15 @@ export function ProvidersPanel() {
         }),
       });
       const data = await res.json();
+      setTestResult({
+        ok: Boolean(data.ok),
+        message: data.message,
+        error: data.error,
+        errorCategory: data.errorCategory,
+        hint: data.hint,
+        model: data.model,
+        at: new Date().toISOString(),
+      });
       if (data.ok) {
         toast({ title: 'Connection OK', description: data.message });
       } else {
@@ -250,13 +324,43 @@ export function ProvidersPanel() {
     if (!current) return;
     setModelsLoading(true);
     try {
-      const res = await fetch(`/api/providers/${current.provider}/models`);
+      // POST: an UNSAVED key must not travel in a URL (it would land in
+      // access logs / browser history). The stored credential is used when the
+      // body has no key, so Refresh works without retyping.
+      const res = await fetch(`/api/providers/${current.provider}/models`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          refresh: true,
+          all: false,
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+          ...(model.trim() ? { model: model.trim() } : {}),
+        }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Could not list models');
       setModels(data.models ?? []);
+      setModelMeta({
+        source: data.source ?? 'catalog',
+        cached: Boolean(data.cached),
+        fetchedAt: data.fetchedAt ?? null,
+        note: data.note,
+        error: data.error,
+        selected: data.selected,
+        selectedNotice: data.selectedNotice,
+      });
       toast({
-        title: data.source === 'provider' ? 'Models from provider' : 'Catalog models',
-        description: `${(data.models ?? []).length} model(s)`,
+        title:
+          data.source === 'provider'
+            ? 'Live models from the provider'
+            : data.source === 'cache'
+              ? 'Cached model list (10 min)'
+              : 'Built-in catalog (not live)',
+        description: `${(data.models ?? []).length} model(s)${
+          data.note ? ` — ${data.note}` : ''
+        }`,
+        variant: data.source === 'catalog' ? 'destructive' : undefined,
       });
     } catch (err) {
       toast({
@@ -267,7 +371,7 @@ export function ProvidersPanel() {
     } finally {
       setModelsLoading(false);
     }
-  }, [current]);
+  }, [current, apiKey, baseUrl, model]);
 
   const remove = useCallback(async () => {
     if (!current) return;
@@ -455,6 +559,28 @@ export function ProvidersPanel() {
                         setup
                       </span>
                     )}
+                    {p.lastTestOk === true ? (
+                      <span
+                        className="text-[9px] text-emerald-400"
+                        title={`Verified by a real test · ${p.lastTestedAt ? new Date(p.lastTestedAt).toLocaleString() : ''}`}
+                      >
+                        ✓ verified
+                      </span>
+                    ) : p.lastTestOk === false ? (
+                      <span
+                        className="text-[9px] text-red-400"
+                        title={p.lastError || 'Last test failed'}
+                      >
+                        ✕ failed
+                      </span>
+                    ) : p.configured ? (
+                      <span
+                        className="text-[9px] text-amber-400/80"
+                        title="Saved on the server but not tested yet — saved is not connected"
+                      >
+                        untested
+                      </span>
+                    ) : null}
                     {p.enabled ? (
                       <span className="text-[10px] text-emerald-400">on</span>
                     ) : (
@@ -548,16 +674,38 @@ export function ProvidersPanel() {
                           <ListChecks className="h-4 w-4" />
                         </Button>
                       </div>
+                      {modelMeta && (
+                        <p className="text-[10px] text-zinc-500 leading-relaxed">
+                          {modelMeta.source === 'provider' ? (
+                            <span className="text-emerald-400">Live list</span>
+                          ) : modelMeta.source === 'cache' ? (
+                            <span className="text-amber-400">Cached list</span>
+                          ) : (
+                            <span className="text-amber-400">Built-in catalog (not live)</span>
+                          )}
+                          {modelMeta.fetchedAt
+                            ? ` · fetched ${new Date(modelMeta.fetchedAt).toLocaleString()}`
+                            : ''}
+                          {modelMeta.note ? ` — ${modelMeta.note}` : ''}
+                          {modelMeta.error ? ` — ${modelMeta.error}` : ''}
+                        </p>
+                      )}
                       {models.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-1 max-h-20 overflow-y-auto">
+                        <div className="flex flex-wrap gap-1 mt-1 max-h-28 overflow-y-auto">
                           {models.map((m) => (
                             <button
                               key={m.id}
                               onClick={() => setModel(m.id)}
-                              className="text-[10px] bg-zinc-800/60 hover:bg-zinc-700 px-1.5 py-0.5 rounded text-zinc-300"
+                              title={m.note ?? (m.free ? 'free tier' : m.legacy ? 'legacy model' : undefined)}
+                              className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                m.id === model
+                                  ? 'bg-emerald-600/30 text-emerald-200'
+                                  : 'bg-zinc-800/60 hover:bg-zinc-700 text-zinc-300'
+                              }`}
                             >
                               {m.id}
                               {m.free ? ' ★' : ''}
+                              {m.legacy ? ' ⚠legacy' : ''}
                             </button>
                           ))}
                         </div>
@@ -639,18 +787,41 @@ export function ProvidersPanel() {
                       )}
                       Test connection
                     </Button>
-                    {current.lastTestedAt && (
+                    {current.lastTestedAt && !testResult && (
                       <span
                         className={`text-[11px] ${
                           current.lastTestOk ? 'text-emerald-400' : 'text-red-400'
                         }`}
+                        title={current.lastError || undefined}
                       >
                         last test {current.lastTestOk ? 'OK' : 'FAILED'} ·{' '}
-                        {new Date(current.lastTestedAt).toLocaleString()}
+                        {relativeTime(current.lastTestedAt)}
                         {current.lastError ? ` — ${current.lastError}` : ''}
                       </span>
                     )}
                   </div>
+                  {testResult && (
+                    <div
+                      className={`mt-3 rounded-lg border p-3 text-[11px] leading-relaxed ${
+                        testResult.ok
+                          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                          : 'border-red-500/40 bg-red-500/10 text-red-200'
+                      }`}
+                    >
+                      <div className="font-semibold">
+                        {testResult.ok ? 'Connected — verified with a real request' : 'Connection failed'}
+                        {testResult.errorCategory && !testResult.ok
+                          ? ` · ${statusLabel(testResult.errorCategory)}`
+                          : ''}
+                      </div>
+                      <div>{testResult.ok ? testResult.message : testResult.error}</div>
+                      {testResult.hint && <div className="text-amber-200/90">{testResult.hint}</div>}
+                      <div className="text-zinc-400">
+                        {testResult.model ? `model: ${testResult.model} · ` : ''}
+                        {relativeTime(testResult.at)} ({new Date(testResult.at).toLocaleTimeString()})
+                      </div>
+                    </div>
+                  )}
                 </section>
               </>
             ) : (
