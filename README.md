@@ -162,6 +162,18 @@ Bridge sirf **127.0.0.1** pe bind hota hai, token (`db/.desktop-token`) ke bina 
 * **Audit**: har desktop click, type, trash, download, history search, Telegram command Audit log me record hota hai.
 * **Server local**: Studio khud hi 127.0.0.1 pe chalta hai + `AGENTSCOPE_API_TOKEN` (production me required) — bahar se laptop control possible nahi.
 
+## Parallel multi-agent execution + live progress (naya)
+
+Engine ab **waves** me chalta hai: independent steps ek saath, aur UI me live board.
+
+* **Wave scheduler** (`studio/src/lib/agentic/parallel.ts`, pure + tested): read-only steps hamesha saath; **writing steps sirf tab saath jab planner ne disjoint files declare kiye hon**; undeclared/overlapping writer akela chalta hai; wave me max `parallelism` agents (1-4, default 3) aur max 2 writers.
+* **Writes serialized rehte hain**: `executeStep` workspace lock sirf critical sections (file apply / commands / snapshot) par leta hai — do writers overlap karte hain sirf apne LLM **thinking** time me, workspace mutation me kabhi nahi. Conflict ho to `WriteConflictError` (chupchaap overwrite nahi).
+* **Live board**: task ke upar `⚡ Live agents — 2/3 busy` — overall progress bar, har agent ka phase (`Thinking → Writing → Commands → Repair → Snapshot`), live elapsed timer, attempt + detail. Naye SSE events: `wave_start`, `step_progress`, `progress` (sab persisted — refresh par board wapas ban jaata hai).
+* **Settings**: UI me Agents 1/2/3/4 + "Parallel writes" switch; API body `{parallelism, parallelWrites}` me; `.env` me `AGENTSCOPE_PARALLEL_WRITES=0` = global kill switch (writes phir serial).
+* **Bug fix saath me**: ek hi step ko do executors (serial loop + wave runner) start kar sakte the — ab shared `claimed` set, turant `running` status, aur resume par orphaned `running` step wapas `pending`.
+
+Poora guide: [`studio/docs/PARALLEL_EXECUTION.md`](studio/docs/PARALLEL_EXECUTION.md) · tests: `bun test tests/parallel.test.ts`
+
 ## Baaki Studio panels
 
 | Panel | Kya karta hai |

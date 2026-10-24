@@ -44,13 +44,21 @@ import {
   checkDependencies,
   detectCycles,
   isReadOnlyKind,
-  planParallelism,
   topologicalOrder,
   WorkspaceLock,
   WriteConflictError,
   type SchedulerStepStatus,
 } from './scheduler';
 import { collectTestEvidence, evaluateTestGate } from './test-gate';
+import {
+  boundedMap,
+  clampParallelism,
+  computeProgress,
+  describeWave,
+  planWave,
+  statusMap,
+  DEFAULT_MAX_PARALLEL_WRITERS,
+} from './parallel';
 import { loadRouterPolicy, loadStoredCredentials } from './provider-store';
 import { detectPlanGaps, hasCriticalGaps, gapsForPlanner } from './plan-gaps';
 import { createNotification } from './notifications';
@@ -65,6 +73,7 @@ import type {
   PendingApproval,
   PlanGap,
   PlanStep,
+  StepPhase,
   TaskConfig,
 } from './types';
 
@@ -74,9 +83,10 @@ const MAX_FILE_CONTEXT = 12;
 const MAX_FILE_CHARS = 4000;
 const DEFAULT_RETRY_BUDGET = 10; // total retries across all steps
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-/** how many read-only steps may run CONCURRENTLY (sub-agent swarm, bounded
- *  for an i3/12GB laptop — raise it only with real hardware headroom) */
+/** default number of agents that may work at the same time (see parallel.ts) */
 const PARALLEL_STEP_LIMIT = 3;
+/** how often a running step reports "still thinking" to the live board */
+const PROGRESS_HEARTBEAT_MS = 10_000;
 
 type Emit = (event: AgenticEvent) => void;
 
@@ -95,6 +105,8 @@ function defaultTaskConfig(): TaskConfig {
     maxSteps: MAX_STEPS,
     maxFixAttempts: MAX_FIX_ATTEMPTS,
     autoPauseOnFailure: true,
+    parallelism: PARALLEL_STEP_LIMIT,
+    parallelWrites: true,
   };
 }
 
@@ -1059,21 +1071,59 @@ async function parkTask(
   }).catch(() => undefined);
 }
 
+/** Parallelism settings of this run (config + env kill switch). */
+export interface ParallelOptions {
+  limit: number;
+  allowWrites: boolean;
+  maxWriters: number;
+}
+
+function resolveParallelOptions(config: TaskConfig): ParallelOptions {
+  const raw = (process.env.AGENTSCOPE_PARALLEL_WRITES ?? '').trim().toLowerCase();
+  const envOff = ['0', 'false', 'off', 'no', 'disabled'].includes(raw);
+  const limit = clampParallelism(config.parallelism ?? PARALLEL_STEP_LIMIT);
+  return {
+    limit,
+    allowWrites: envOff ? false : config.parallelWrites !== false,
+    maxWriters: Math.min(limit, DEFAULT_MAX_PARALLEL_WRITERS),
+  };
+}
+
 /**
- * The PARALLEL SUB-AGENT RUNNER (Feature 4).
- *
- * Independent READ-ONLY steps (analyze / research) whose dependencies are
- * satisfied run CONCURRENTLY, bounded by PARALLEL_STEP_LIMIT. They never
- * touch the workspace (executeStep refuses writes + non-safe commands for
- * read-only kinds), so they cannot conflict with the serialized writers.
- *
- * The runner loops until no read-only step is ready. It stops early on
- * cancel/pause. Failures of a parallel step are recorded on its own row —
- * the serial loop's dependency logic decides what happens to the steps that
- * depended on it (broken dependency → skipped, exactly like a serial
- * failure).
+ * Reserve a step for ONE executor.
+ * Both the serial loop and the wave runner go through this: the check and the
+ * insert happen synchronously, so the same step can never be started twice.
  */
-async function runParallelReadOnlySteps(params: {
+function claimStep(claimed: Set<number>, index: number): boolean {
+  if (claimed.has(index)) return false;
+  claimed.add(index);
+  return true;
+}
+
+interface WaveRunResult {
+  ran: number;
+  parked: 'transient' | 'blocked' | null;
+  /** the first step that failed hard — the caller runs the repair cycle */
+  failed: { planStep: PlanStep; stepId: string; stepIndex: number; title: string; output: string } | null;
+  /** a step is waiting for the user's approval */
+  awaiting: boolean;
+  /** cancelled / paused / timed out — stop launching new waves */
+  stopped: boolean;
+  timedOut: boolean;
+}
+
+/**
+ * Wave executor: keeps planning the next wave of independent steps and runs
+ * its agents concurrently.
+ *
+ * - read-only agents never overlap with a write (they do not write);
+ * - two WRITING agents share a wave only when the planner declared disjoint
+ *   file scopes — their actual writes are still serialized by the workspace
+ *   lock inside `executeStep`, so they overlap only in their thinking time;
+ * - everything that fails/pauses/asks for approval stops new waves, exactly
+ *   like the serial loop does.
+ */
+async function runParallelWaves(params: {
   task: { id: string; prompt: string; provider: string; model: string; projectRoot?: string };
   planSteps: PlanStep[];
   mergedConfig: TaskConfig;
@@ -1083,42 +1133,101 @@ async function runParallelReadOnlySteps(params: {
   approvedCommands: string[];
   startedAt: string;
   lock: WorkspaceLock;
-}): Promise<{ ran: number; parked: 'transient' | 'blocked' | null }> {
-  const { task, planSteps, mergedConfig, emit, router, bus, approvedCommands, startedAt, lock } =
-    params;
-  let ran = 0;
-  let parked: 'transient' | 'blocked' | null = null;
+  claimed: Set<number>;
+  parallel: ParallelOptions;
+}): Promise<WaveRunResult> {
+  const {
+    task,
+    planSteps,
+    mergedConfig,
+    emit,
+    router,
+    bus,
+    approvedCommands,
+    startedAt,
+    lock,
+    claimed,
+    parallel,
+  } = params;
+
+  const result: WaveRunResult = {
+    ran: 0,
+    parked: null,
+    failed: null,
+    awaiting: false,
+    stopped: false,
+    timedOut: false,
+  };
+
+  // the final `review` step is owned by the serial reviewer branch — it needs
+  // the whole diff + test evidence, not a normal agent turn
+  const schedulable = planSteps.filter((s) => s.kind !== 'review');
 
   for (;;) {
-    if (await isCancelled(task.id) || await isPaused(task.id)) return { ran, parked };
+    if (await isCancelled(task.id)) {
+      result.stopped = true;
+      return result;
+    }
+    if (await isPaused(task.id)) {
+      result.stopped = true;
+      return result;
+    }
+    if (await isAwaitingApproval(task.id)) {
+      // the user's answer (or a resumed run) is the only way forward
+      result.awaiting = true;
+      return result;
+    }
+    if (hasTimedOut({ startedAt, config: mergedConfig })) {
+      result.timedOut = true;
+      result.stopped = true;
+      return result;
+    }
+
     const rows = await db.agenticStep.findMany({
       where: { taskId: task.id },
       select: { index: true, status: true },
     });
-    const statuses = new Map(rows.map((r) => [r.index, r.status as SchedulerStepStatus]));
-    const { parallel } = planParallelism(planSteps, statuses);
-    if (!parallel.length) return { ran, parked };
+    const wave = planWave(schedulable, statusMap(rows), {
+      limit: parallel.limit,
+      allowParallelWrites: parallel.allowWrites,
+      maxWriters: parallel.maxWriters,
+    });
+    if (!wave) return result;
 
-    const batch = parallel.slice(0, PARALLEL_STEP_LIMIT);
+    // reserve the whole wave before launching anything
+    const waveSteps = wave.steps.filter((s) => claimStep(claimed, s.index));
+    if (!waveSteps.length) return result;
+
+    emit({
+      type: 'wave_start',
+      taskId: task.id,
+      at: new Date().toISOString(),
+      data: {
+        wave: waveSteps.map((s) => ({ index: s.index, title: s.title, kind: s.kind })),
+        reason: wave.reason,
+        concurrent: wave.concurrent,
+        writers: wave.writers,
+        disjointWriters: wave.disjointWriters,
+        limit: parallel.limit,
+        parallelWrites: parallel.allowWrites,
+      },
+    });
     emit({
       type: 'log',
       taskId: task.id,
       at: new Date().toISOString(),
-      data: {
-        text: asciiText(
-          `🧩 ${batch.length} independent read-only step(s) running in parallel: ${batch
-            .map((s) => `#${s.index}`)
-            .join(', ')}`
-        ),
-      },
+      data: { text: asciiText(`🧩 ${describeWave({ ...wave, steps: waveSteps })}`) },
     });
 
-    const outcomes = await Promise.all(
-      batch.map(async (planStep) => {
+    let passedInWave = 0;
+    let failedInWave = false;
+
+    try {
+      const outcomes = await boundedMap(waveSteps, parallel.limit, async (planStep) => {
         const step = await db.agenticStep.findFirst({
           where: { taskId: task.id, index: planStep.index },
         });
-        if (!step) return { kind: 'skipped' } as StepOutcome;
+        if (!step) return { kind: 'skipped' as const };
         await db.agenticTask
           .update({ where: { id: task.id }, data: { currentStep: planStep.index - 1 } })
           .catch(() => undefined);
@@ -1131,7 +1240,9 @@ async function runParallelReadOnlySteps(params: {
             title: planStep.title,
             kind: planStep.kind,
             agent: roleForStep(planStep.kind),
-            parallel: true,
+            parallel: waveSteps.length > 1,
+            waveReason: wave.reason,
+            declaredFiles: planStep.files ?? [],
             dependencies: planStep.dependencies ?? [],
           },
         });
@@ -1148,27 +1259,96 @@ async function runParallelReadOnlySteps(params: {
           approvedCommands,
           startedAt,
           lock,
-          readOnlyStep: true,
+          readOnlyStep: isReadOnlyKind(planStep.kind),
           resumeFrom: undefined,
           getRetriesUsed: () => 0,
           bumpRetries: async () => {
-            // parallel read-only attempts still count against the task-wide
-            // budget (atomic increment); the serial loop re-reads the counter
+            // parallel attempts still count against the task-wide budget
+            // (atomic increment); the serial loop re-reads the counter
             await bumpRetryCounter(task.id).catch(() => 0);
           },
         });
-      })
-    );
+      });
 
-    for (const outcome of outcomes) {
-      if (outcome.kind === 'passed') ran++;
-      if (outcome.kind === 'transient' && !parked) parked = 'transient';
-      if (outcome.kind === 'blocked' && !parked) parked = 'blocked';
+      waveSteps.forEach((planStep, i) => {
+        const outcome = outcomes[i];
+        if (outcome.kind === 'passed') {
+          result.ran++;
+          passedInWave++;
+        }
+        if (outcome.kind === 'failed' && !result.failed) {
+          failedInWave = true;
+          result.failed = {
+            planStep,
+            stepId: `step-${planStep.index}`,
+            stepIndex: planStep.index,
+            title: planStep.title,
+            output: outcome.output,
+          };
+        }
+        if (outcome.kind === 'transient' && !result.parked) result.parked = 'transient';
+        if (outcome.kind === 'blocked' && !result.parked) result.parked = 'blocked';
+        if (outcome.kind === 'awaiting_approval') result.awaiting = true;
+        if (outcome.kind === 'cancelled' || outcome.kind === 'paused') result.stopped = true;
+        if (outcome.kind === 'timeout') result.timedOut = true;
+      });
+    } finally {
+      for (const planStep of waveSteps) claimed.delete(planStep.index);
     }
-    if (parked) return { ran, parked };
 
-    // no progress in this batch → exit (avoid a spin loop)
-    if (!outcomes.some((o) => o.kind === 'passed' || o.kind === 'failed')) return { ran, parked };
+    // task-level progress for the live board
+    await emitProgressSnapshot(task.id, emit);
+
+    if (result.stopped || result.awaiting || result.parked || failedInWave) return result;
+    // no progress in this wave → stop instead of spinning forever
+    if (!passedInWave) return result;
+  }
+}
+
+/**
+ * Run `fn` while holding the task's exclusive workspace write lock.
+ *
+ * The lock is taken per CRITICAL SECTION (file apply / commands / snapshot),
+ * not for the whole step — that is what lets two writing agents overlap in
+ * their LLM time while their actual workspace mutations stay serialized.
+ */
+async function withWriteLock<T>(
+  lock: WorkspaceLock,
+  holder: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const release = await lock.acquireWrite(holder);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+/** Is the command gate holding the whole task right now? */
+async function isAwaitingApproval(taskId: string): Promise<boolean> {
+  const task = await db.agenticTask.findUnique({
+    where: { id: taskId },
+    select: { status: true },
+  });
+  return task?.status === 'awaiting_approval';
+}
+
+/** Emit the aggregate progress of the task (used by the live board). */
+async function emitProgressSnapshot(taskId: string, emit: Emit): Promise<void> {
+  try {
+    const rows = await db.agenticStep.findMany({
+      where: { taskId },
+      select: { index: true, status: true },
+    });
+    emit({
+      type: 'progress',
+      taskId,
+      at: new Date().toISOString(),
+      data: computeProgress(rows),
+    });
+  } catch {
+    // progress is cosmetic — never break a run for it
   }
 }
 
@@ -1211,6 +1391,13 @@ export async function runTask(
   if (isResume) {
     await db.agenticStep.updateMany({
       where: { taskId, status: 'failed' },
+      data: { status: 'pending' },
+    });
+    // A step that was 'running' when the process died is ORPHANED: nothing is
+    // executing it any more, so it would block the task forever. Put it back
+    // into the queue (its attempt counter is kept, so no fresh budget).
+    await db.agenticStep.updateMany({
+      where: { taskId, status: 'running' },
       data: { status: 'pending' },
     });
     await db.agenticTask.update({
@@ -1364,11 +1551,15 @@ export async function runTask(
     }
   }
 
-  // ---- parallel sub-agent runner (Feature 4) ----
-  // Independent READ-ONLY steps run concurrently in the BACKGROUND while
-  // the serial loop below walks the writers. A shared promise tracks it so
-  // the finish waits for every agent.
-  const parallelDone = runParallelReadOnlySteps({
+  // ---- wave executor (parallel multi-agent) ----
+  // Independent steps run concurrently in the BACKGROUND: read-only agents
+  // always, writing agents only when the planner declared disjoint file
+  // scopes (and even then their writes are serialized by the workspace lock).
+  // The serial loop below walks the dependency chains; `claimed` guarantees a
+  // step is never started twice by the two executors.
+  const parallel = resolveParallelOptions(mergedConfig);
+  const claimed = new Set<number>();
+  const parallelDone: Promise<WaveRunResult> = runParallelWaves({
     task,
     planSteps,
     mergedConfig,
@@ -1378,7 +1569,29 @@ export async function runTask(
     approvedCommands,
     startedAt,
     lock,
-  }).catch(() => ({ ran: 0, parked: null }) as { ran: number; parked: 'transient' | 'blocked' | null });
+    claimed,
+    parallel,
+  }).catch(() => ({
+    ran: 0,
+    parked: null,
+    failed: null,
+    awaiting: false,
+    stopped: true,
+    timedOut: false,
+  }) as WaveRunResult);
+
+  emit({
+    type: 'log',
+    taskId,
+    at: new Date().toISOString(),
+    data: {
+      text: asciiText(
+        `⚡ Parallel execution: up to ${parallel.limit} agent(s), parallel writes ${
+          parallel.allowWrites ? `ON (max ${parallel.maxWriters} disjoint-scope writer)` : 'OFF'
+        }`
+      ),
+    },
+  });
 
   // ---- step loop ----
   let retriesUsed = await countRetriesUsed(taskId);
@@ -1397,6 +1610,12 @@ export async function runTask(
         at: new Date().toISOString(),
         data: { stepIndex: pos, reason: 'User paused task' },
       });
+      await emit.drain();
+      return;
+    }
+    if (await isAwaitingApproval(taskId)) {
+      // a parallel agent stopped at the approval gate — no other step may
+      // overtake it just because the serial loop happens to be here
       await emit.drain();
       return;
     }
@@ -1431,6 +1650,10 @@ export async function runTask(
 
     const planStep = execOrder[pos];
 
+    // a step the wave executor already reserved is not touched by this loop
+    // (and a review step is never scheduled by the wave executor)
+    if (planStep.kind !== 'review' && claimed.has(planStep.index)) continue;
+
     // ---- dependency check ----
     const statuses = await statusOf();
     const deps = checkDependencies(planStep, statuses);
@@ -1462,7 +1685,7 @@ export async function runTask(
     if (!step) continue;
     // On resume, skip steps that already reached a terminal status so they
     // are not re-executed (re-running LLM calls, file writes, git snapshots).
-    if (['passed', 'skipped', 'failed', 'denied'].includes(step.status)) {
+    if (['passed', 'skipped', 'failed', 'denied', 'running'].includes(step.status)) {
       continue;
     }
 
@@ -1485,6 +1708,13 @@ export async function runTask(
 
     // review step handled separately after all others
     if (planStep.kind === 'review') {
+      // the reviewer judges the WHOLE diff — never start it while agents are
+      // still writing (the wave executor drains as soon as only review is left)
+      const wavesBeforeReview = await parallelDone;
+      if (wavesBeforeReview.awaiting || wavesBeforeReview.parked) {
+        await emit.drain();
+        return;
+      }
       await stepSetStatus(step.id, 'running');
       // the task is VERIFYING: the reviewer + the hard test-evidence gate run
       // here, which is exactly what "verifying" means in the lifecycle
@@ -1549,27 +1779,35 @@ export async function runTask(
 
     // implement / analyze / test steps
     const readOnlyStep = isReadOnlyKind(planStep.kind);
-    const outcome = await executeStep({
-      task,
-      planStep,
-      step,
-      pos,
-      planSteps,
-      mergedConfig,
-      emit,
-      router,
-      bus,
-      approvedCommands,
-      startedAt,
-      lock,
-      readOnlyStep,
-      resumeFrom:
-        resumeFrom.forIndex === planStep.index ? resumeFrom : undefined,
-      getRetriesUsed: () => retriesUsed,
-      bumpRetries: async () => {
-        retriesUsed = await bumpRetryCounter(taskId);
-      },
-    });
+    // reserve the step so the wave executor cannot start it at the same time
+    if (!claimStep(claimed, planStep.index)) continue;
+    let outcome: StepOutcome;
+    try {
+      outcome = await executeStep({
+        task,
+        planStep,
+        step,
+        pos,
+        planSteps,
+        mergedConfig,
+        emit,
+        router,
+        bus,
+        approvedCommands,
+        startedAt,
+        lock,
+        readOnlyStep,
+        resumeFrom:
+          resumeFrom.forIndex === planStep.index ? resumeFrom : undefined,
+        getRetriesUsed: () => retriesUsed,
+        bumpRetries: async () => {
+          retriesUsed = await bumpRetryCounter(taskId);
+        },
+      });
+    } finally {
+      claimed.delete(planStep.index);
+    }
+    await emitProgressSnapshot(taskId, emit);
 
     if (outcome.kind === 'cancelled' || outcome.kind === 'paused' || outcome.kind === 'awaiting_approval') {
       await emit.drain();
@@ -1612,12 +1850,20 @@ export async function runTask(
 
   // ---- the serial loop is over: wait for the parallel agents ----
   const parallelResult = await parallelDone;
+  if (parallelResult.timedOut) {
+    await finishTask(taskId, 'failed', emit, {
+      summary: 'Task timeout exceeded while a parallel agent was running.',
+      remainingBugs: ['Task timed out during a parallel wave'],
+    });
+    await emit.drain();
+    return;
+  }
   if (parallelResult.parked === 'transient') {
     await parkTask(
       taskId,
       'retry_wait',
       emit,
-      'A parallel read-only step hit a temporary error.',
+      'A parallel agent hit a temporary error.',
       mergedConfig
     );
     await emit.drain();
@@ -1628,11 +1874,39 @@ export async function runTask(
       taskId,
       'blocked',
       emit,
-      'A parallel read-only step is missing a prerequisite (credentials/dependency).',
+      'A parallel agent is missing a prerequisite (credentials/dependency).',
       mergedConfig
     );
     await emit.drain();
     return;
+  }
+  if (parallelResult.awaiting) {
+    // the command gate is holding the run — nothing else to do until the user
+    // answers; the task row already says `awaiting_approval`
+    await emit.drain();
+    return;
+  }
+  if (parallelResult.failed) {
+    const failedStep = await db.agenticStep.findFirst({
+      where: { taskId, index: parallelResult.failed.stepIndex },
+    });
+    if (failedStep) {
+      await handleStepFailure(
+        task,
+        {
+          id: failedStep.id,
+          index: failedStep.index,
+          title: failedStep.title,
+        },
+        planSteps,
+        parallelResult.failed.output,
+        emit,
+        approvedCommands,
+        mergedConfig
+      );
+      await emit.drain();
+      return;
+    }
   }
 
   // ---- steps whose dependencies were PENDING while the serial loop passed
@@ -1726,10 +2000,41 @@ async function executeStep(params: {
     fromCommandIndex = resumeFrom.commandIndex;
   }
 
-  // a writer holds the exclusive workspace lock for the whole step
-  const release = readOnlyStep
-    ? () => undefined
-    : await lock.acquireWrite(`step-${planStep.index}`);
+  const holder = `step-${planStep.index}`;
+  const stepStartedAt = Date.now();
+
+  /**
+   * Report what this agent is doing RIGHT NOW.
+   * Every phase change (and a heartbeat while the model is thinking) is
+   * persisted as a `step_progress` event, so the live board shows real state
+   * and a reconnecting client can rebuild it from the event log.
+   */
+  const progress = (phase: StepPhase, detail?: string, extra: Record<string, unknown> = {}) => {
+    emit({
+      type: 'step_progress',
+      taskId: task.id,
+      at: new Date().toISOString(),
+      stepIndex,
+      data: {
+        phase,
+        elapsedMs: Date.now() - stepStartedAt,
+        attempt: attempts,
+        agent: roleForStep(planStep.kind),
+        ...(detail ? { detail: asciiText(detail) } : {}),
+        ...extra,
+      },
+    });
+  };
+
+  /** critical sections of a WRITER hold the workspace lock; readers never do */
+  const runLocked = <T>(fn: () => Promise<T>): Promise<T> =>
+    readOnlyStep ? fn() : withWriteLock(lock, holder, fn);
+
+  // the step is 'running' from the moment its agent wakes up — the live board
+  // can then tell "working" from "queued", and an orphaned 'running' row is
+  // reset on resume instead of blocking the task forever
+  await stepSetStatus(step.id, 'running').catch(() => undefined);
+  progress('queued', `${roleForStep(planStep.kind)} starting`);
 
   try {
     for (;;) {
@@ -1761,6 +2066,14 @@ async function executeStep(params: {
           provider: string;
           model: string;
         };
+        progress(
+          'thinking',
+          `${roleForStep(planStep.kind)} is planning the step (attempt ${attempts + 1})`
+        );
+        const heartbeat = setInterval(() => {
+          progress('thinking', `${roleForStep(planStep.kind)} is still working`);
+        }, PROGRESS_HEARTBEAT_MS);
+        (heartbeat as unknown as { unref?: () => void }).unref?.();
         try {
           produced = await runStepAgent(
             task,
@@ -1793,6 +2106,8 @@ async function executeStep(params: {
           }
           await stepLog(step.id, 'error', `${roleForStep(planStep.kind)} LLM error: ${msg}`);
           return { kind: 'failed', output: msg };
+        } finally {
+          clearInterval(heartbeat);
         }
         actions = produced.actions;
         stepModel = { provider: produced.provider, model: produced.model };
@@ -1820,8 +2135,36 @@ async function executeStep(params: {
             });
             return { kind: 'failed', output: blocked };
           }
+          progress('writing', `Writing ${actions.files.length} file(s)`);
+          // claim + apply + record inside the workspace lock
           try {
-            lock.claimPaths(`step-${planStep.index}`, paths);
+            await runLocked(async () => {
+              lock.claimPaths(holder, paths);
+              const changes = await applyFileActions(task.id, actions!.files);
+              for (const c of changes) {
+                emit({
+                  type: 'file_write',
+                  taskId: task.id,
+                  at: new Date().toISOString(),
+                  stepIndex,
+                  data: c,
+                });
+                await stepLog(step.id, 'file', `${c.action}: ${c.path} (${c.bytes} bytes)`);
+              }
+              await db.agenticStep.update({
+                where: { id: step.id },
+                data: {
+                  filesChanged: JSON.stringify(
+                    Array.from(
+                      new Set([
+                        ...(JSON.parse(step.filesChanged || '[]') as string[]),
+                        ...changes.map((c) => c.path),
+                      ])
+                    )
+                  ),
+                },
+              });
+            });
           } catch (err) {
             if (err instanceof WriteConflictError) {
               await stepLog(step.id, 'error', err.message);
@@ -1836,42 +2179,25 @@ async function executeStep(params: {
             }
             throw err;
           }
-          const changes = await applyFileActions(task.id, actions.files);
-          for (const c of changes) {
-            emit({
-              type: 'file_write',
-              taskId: task.id,
-              at: new Date().toISOString(),
-              stepIndex,
-              data: c,
-            });
-            await stepLog(step.id, 'file', `${c.action}: ${c.path} (${c.bytes} bytes)`);
-          }
-          await db.agenticStep.update({
-            where: { id: step.id },
-            data: {
-              filesChanged: JSON.stringify(
-                Array.from(
-                  new Set([
-                    ...(JSON.parse(step.filesChanged || '[]') as string[]),
-                    ...changes.map((c) => c.path),
-                  ])
-                )
-              ),
-            },
-          });
         }
       }
 
-      const batch = await runCommandBatch(
-        task.id,
-        step.id,
-        stepIndex,
-        actions,
-        fromCommandIndex,
-        approvedCommands,
-        emit,
-        readOnlyStep
+      const pendingCommands = Math.max(0, actions.commands.length - fromCommandIndex);
+      if (pendingCommands > 0) {
+        progress('commands', `Running ${pendingCommands} command(s)`);
+      }
+      // commands may write to the workspace → writers run them under the lock
+      const batch = await runLocked(() =>
+        runCommandBatch(
+          task.id,
+          step.id,
+          stepIndex,
+          actions!,
+          fromCommandIndex,
+          approvedCommands,
+          emit,
+          readOnlyStep
+        )
       );
       // C3: the batch was aborted because the task was cancelled mid-run.
       // The flag MUST be checked here — falling through would mark the step
@@ -1917,6 +2243,10 @@ async function executeStep(params: {
         // and the step is re-executed (files re-applied, commands re-run).
         // The loop is bounded by `maxAttempts` above AND by the task-wide
         // retry budget checked in the caller, so it can never spin forever.
+        progress(
+          'repair',
+          `Attempt ${attempts}/${maxAttempts} failed (exit=${batch.fail.exitCode}) — targeted fix`
+        );
         emit({
           type: 'log',
           taskId: task.id,
@@ -1949,9 +2279,14 @@ async function executeStep(params: {
       }
 
       // success
-      const snap = await snapshot(task.id, `step-${planStep.index}: ${planStep.title}`);
-      await stepSetStatus(step.id, 'passed', { testResult: 'pass' });
+      progress('snapshot', 'Recording the workspace snapshot');
+      const snap = await runLocked(async () => {
+        const committed = await snapshot(task.id, `step-${planStep.index}: ${planStep.title}`);
+        await stepSetStatus(step.id, 'passed', { testResult: 'pass' });
+        return committed;
+      });
       await stepLog(step.id, 'diff', `git snapshot: ${snap.hash} (${snap.label})`);
+      progress('done', 'Step passed', { status: 'passed' });
       emit({
         type: 'step_done',
         taskId: task.id,
@@ -1983,8 +2318,10 @@ async function executeStep(params: {
       return { kind: 'passed', attempts, snapshotHash: snap.hash };
     }
   } finally {
-    release();
-    lock.releasePaths(`step-${planStep.index}`);
+    // the critical sections released their own locks; the claimed PATHS stay
+    // reserved until the step is fully over (a conflicting writer is caught by
+    // claimPaths instead of silently overwriting an in-flight file)
+    lock.releasePaths(holder);
   }
 }
 

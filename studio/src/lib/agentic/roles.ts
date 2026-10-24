@@ -46,10 +46,15 @@ Rules:
 - Final step MUST be kind "test" or "review" with concrete acceptance (commands to run and expected result).
 - Use simple cross-platform tools available in the sandbox: bash, python3 (stdlib), node, git.
 - DO NOT include code in the plan. DO NOT use network-dependent or GUI-dependent steps.
-- Dependencies: a step may declare "dependencies":[{"stepIndex":N,"type":"blocks"}]. "blocks" means this step must run AFTER step N. Independent "analyze" steps (no dependency between them) are executed in PARALLEL by the engine. Never declare a dependency on yourself and never create a cycle.
+- Dependencies: a step may declare "dependencies":[{"stepIndex":N,"type":"blocks"}]. "blocks" means this step must run AFTER step N. Never declare a dependency on yourself and never create a cycle.
+- PARALLELISM: independent steps run AT THE SAME TIME (up to 4 agents concurrently). Therefore:
+  * a step that WRITES files MUST declare every file it touches in "files":["relative/path", ...];
+  * two writing steps only share a wave when their "files" lists are disjoint — if two steps touch the same file, add a "blocks" dependency between them;
+  * verification steps ("test"/"review") must depend on ("blocks") the steps they verify;
+  * never let two steps install packages or run global commands at the same time — chain them with "blocks".
 
 Reply with ONLY valid JSON, no markdown fence, exactly this shape:
-{"title":"short task title","steps":[{"index":1,"title":"...","description":"...","kind":"analyze|implement|test|review|research|debug|security|docs","acceptance":"how we verify this step passed","dependencies":[{"stepIndex":2,"type":"blocks"}]}]}`,
+{"title":"short task title","steps":[{"index":1,"title":"...","description":"...","kind":"analyze|implement|test|review|research|debug|security|docs","acceptance":"how we verify this step passed","files":["src/app.py"],"dependencies":[{"stepIndex":2,"type":"blocks"}]}]}`,
   },
   coder: {
     name: 'coder',
@@ -212,6 +217,25 @@ export function buildPlanParse(reply: string): { title: string; steps: PlanStep[
     kind: kinds.includes(s.kind) ? s.kind : 'implement',
     acceptance: String(s.acceptance ?? '').slice(0, 300),
   }));
+
+  // Declared write scope. This is what makes concurrent WRITERS safe: the
+  // scheduler only overlaps two writers when their scopes are disjoint.
+  // Absolute paths, '..' escapes and oversized entries are dropped — the
+  // scope is a scheduling hint, never a permission.
+  rawSteps.forEach((s: any, i: number) => {
+    const declared = Array.isArray(s.files) ? s.files : [];
+    const files: string[] = [];
+    for (const f of declared) {
+      const raw = String(f ?? '').trim().replace(/\\/g, '/');
+      if (!raw || raw.length > 200) continue;
+      if (raw.startsWith('/') || /^[a-zA-Z]:/.test(raw)) continue;
+      if (raw.split('/').includes('..')) continue;
+      if (files.includes(raw)) continue;
+      files.push(raw);
+      if (files.length >= 12) break;
+    }
+    if (files.length) steps[i].files = files;
+  });
 
   // Dependencies are parsed AFTER the steps are numbered so the referenced
   // index can be validated against the real step count. A dependency on an

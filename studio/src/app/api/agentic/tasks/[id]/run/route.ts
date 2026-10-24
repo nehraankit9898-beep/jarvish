@@ -6,6 +6,7 @@ import { resolveApprovedCommands } from '@/lib/agentic/approvals';
 import { normalizeTaskStatus, isTerminalStatus } from '@/lib/agentic/types';
 import { normalizeAgentConfig, redactAgentConfig, type CredentialMap, type AgentRoutingConfig } from '@/lib/agentic/agent-config';
 import { lastEventSeq } from '@/lib/agentic/event-store';
+import { parallelConfigFromBody } from '@/lib/agentic/parallel';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -78,6 +79,10 @@ export async function POST(
       command?: string;
       agentConfig?: AgentRoutingConfig;
       credentials?: CredentialMap;
+      /** how many agents may work at the same time (1-4) */
+      parallelism?: number;
+      /** let writing steps with disjoint declared scopes overlap */
+      parallelWrites?: boolean;
     };
 
     const status = normalizeTaskStatus(task.status);
@@ -168,6 +173,7 @@ export async function POST(
       approvedCommands,
       routing,
       credentials: body.credentials,
+      taskConfig: parallelConfigFromBody(body),
     }).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Run failed';
       await db.agenticTask

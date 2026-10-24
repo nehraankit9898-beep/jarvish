@@ -145,6 +145,14 @@ export interface PlanStep {
   dependencies?: StepDependency[]; // steps this depends on
   timeoutMs?: number; // per-step timeout override
   retryBudget?: number; // per-step retry budget override
+  /**
+   * Files this step INTENDS to write (workspace-relative).
+   *
+   * The parallel scheduler only lets two writing steps share a wave when
+   * their declared scopes are disjoint — this is what makes concurrent
+   * writers safe. A writing step without `files` always runs alone.
+   */
+  files?: string[];
 }
 
 export interface CommandRecord {
@@ -208,7 +216,11 @@ export interface AgenticEvent {
     | 'blocked'
     | 'unblocked'
     | 'browser'
-    | 'takeover';
+    | 'takeover'
+    // --- parallel execution + live progress additions ---
+    | 'wave_start'
+    | 'step_progress'
+    | 'progress';
   taskId: string;
   at: string;
   stepIndex?: number;
@@ -296,7 +308,26 @@ export interface TaskConfig {
   retryDelayMs?: number;
   /** true for goal tasks: survive across sessions, higher limits */
   longRunning?: boolean;
+  /** how many agents may work at the same time (1 = fully serial, max 4) */
+  parallelism?: number;
+  /** let two writing steps with DISJOINT declared file scopes overlap */
+  parallelWrites?: boolean;
 }
+
+/**
+ * Live phase of a running step — what the agent is doing right now.
+ * Emitted with every `step_progress` event so the UI can show real progress
+ * instead of a spinner.
+ */
+export type StepPhase =
+  | 'queued'
+  | 'thinking' // the role model is producing the step content
+  | 'writing' // files are being applied to the workspace
+  | 'commands' // the step's verification commands are running
+  | 'repair' // a failed attempt is being repaired (targeted fix)
+  | 'snapshot' // the step is being committed to the workspace git snapshot
+  | 'reviewing' // the reviewer is judging the diff
+  | 'done';
 
 /** A detected plan gap (missing prerequisite the planner missed). */
 export interface PlanGap {

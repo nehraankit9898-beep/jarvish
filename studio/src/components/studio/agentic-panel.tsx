@@ -6,6 +6,8 @@ import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Progress } from '@/components/ui/progress';
+import { Switch } from '@/components/ui/switch';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,6 +35,7 @@ import {
   ShieldAlert,
   TerminalSquare,
   Users,
+  Zap,
   Wifi,
   WifiOff,
   XCircle,
@@ -79,11 +82,24 @@ interface AgentMessageData {
   model?: string;
 }
 
+interface ProgressCounts {
+  total: number;
+  passed: number;
+  failed: number;
+  denied: number;
+  skipped: number;
+  running: number;
+  pending: number;
+  done: number;
+  percent: number;
+}
+
 interface TaskData {
   id: string;
   prompt: string;
   status: string;
   plan: PlanStep[];
+  progress?: ProgressCounts;
   planGaps?: { kind: string; description: string; suggestion: string; severity: string }[];
   blockedReason?: string;
   currentStep: number;
@@ -148,6 +164,322 @@ interface RoleAssignment {
   fallbackModel?: string;
 }
 
+const PHASE_META: Record<string, { label: string; cls: string; emoji: string }> = {
+  queued: { label: 'Starting', cls: 'text-zinc-400', emoji: '⏳' },
+  thinking: { label: 'Thinking', cls: 'text-sky-300', emoji: '🧠' },
+  writing: { label: 'Writing files', cls: 'text-emerald-300', emoji: '✍️' },
+  commands: { label: 'Running commands', cls: 'text-amber-300', emoji: '💻' },
+  repair: { label: 'Repairing', cls: 'text-orange-300', emoji: '🔧' },
+  snapshot: { label: 'Snapshot', cls: 'text-violet-300', emoji: '📸' },
+  reviewing: { label: 'Reviewing', cls: 'text-indigo-300', emoji: '🔍' },
+  done: { label: 'Done', cls: 'text-emerald-300', emoji: '✅' },
+};
+
+const WAVE_REASON_LABEL: Record<string, string> = {
+  'read-only': 'read-only agents',
+  'disjoint-writes': 'disjoint-scope writers',
+  mixed: 'reader + writer',
+  'serialized-write': 'single writer',
+  single: 'single step',
+};
+
+/** local progress computation (same rules as the server: terminal steps only) */
+function localProgress(steps: { status: string }[]): ProgressCounts {
+  const counts: ProgressCounts = {
+    total: steps.length,
+    passed: 0,
+    failed: 0,
+    denied: 0,
+    skipped: 0,
+    running: 0,
+    pending: 0,
+    done: 0,
+    percent: 0,
+  };
+  for (const s of steps) {
+    if (s.status === 'passed') counts.passed++;
+    else if (s.status === 'failed') counts.failed++;
+    else if (s.status === 'denied') counts.denied++;
+    else if (s.status === 'skipped') counts.skipped++;
+    else if (s.status === 'running' || s.status === 'awaiting_approval') counts.running++;
+    else counts.pending++;
+  }
+  counts.done = counts.passed + counts.failed + counts.denied + counts.skipped;
+  counts.percent = counts.total ? Math.round((counts.done / counts.total) * 100) : 0;
+  return counts;
+}
+
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+interface LiveAgentView {
+  index: number;
+  title: string;
+  kind: string;
+  status: string;
+  phase: string;
+  detail?: string;
+  attempt?: number;
+  elapsedMs: number;
+}
+
+/**
+ * The live board: who is working RIGHT NOW, on what, and since when.
+ *
+ * Data comes from two places so it survives a refresh:
+ *  - `task.steps` (persisted status, authoritative),
+ *  - `step_progress` events (phase + elapsed, replayed from the event log).
+ * The elapsed timer keeps ticking locally between events.
+ */
+interface LiveStepRow {
+  index: number;
+  title: string;
+  kind: string;
+  status: string;
+  phase: string;
+  detail?: string;
+  attempt?: number;
+  elapsedMs: number;
+  lastAt: number;
+}
+
+function LiveBoard({
+  task,
+  events,
+  tick,
+  parallelism,
+  parallelWrites,
+  editable,
+  busy,
+  onParallelism,
+  onParallelWrites,
+}: {
+  task: TaskData;
+  events: AgenticEvent[];
+  tick: number;
+  parallelism: number;
+  parallelWrites: boolean;
+  editable: boolean;
+  busy: boolean;
+  onParallelism: (value: number) => void;
+  onParallelWrites: (value: boolean) => void;
+}) {
+  /**
+   * One row per plan step, built from BOTH sources:
+   *  - `task.steps` (persisted, refreshed on load / after a control action),
+   *  - the live event log (`step_start` / `step_progress` / `step_done`),
+   *    which is the only thing that moves while a run is in flight.
+   * Events win because they are newer; the persisted row is the fallback for
+   * a task that was loaded but never streamed.
+   */
+  const derived = useMemo(() => {
+    const map = new Map<number, LiveStepRow>();
+
+    for (const s of task.steps) {
+      map.set(s.index - 1, {
+        index: s.index,
+        title: s.title,
+        kind: s.kind,
+        status: s.status,
+        phase: 'queued',
+        elapsedMs: 0,
+        lastAt: 0,
+      });
+    }
+
+    for (const e of events) {
+      if (typeof e.stepIndex !== 'number') continue;
+      const current = map.get(e.stepIndex);
+      const d = (e.data ?? {}) as {
+        phase?: string;
+        detail?: string;
+        elapsedMs?: number;
+        attempt?: number;
+        title?: string;
+        kind?: string;
+        status?: string;
+      };
+      const base: LiveStepRow = current ?? {
+        index: e.stepIndex + 1,
+        title: d.title ?? `Step ${e.stepIndex + 1}`,
+        kind: d.kind ?? 'implement',
+        status: 'pending',
+        phase: 'queued',
+        elapsedMs: 0,
+        lastAt: 0,
+      };
+      if (e.type === 'step_start') {
+        map.set(e.stepIndex, {
+          ...base,
+          title: d.title ?? base.title,
+          kind: d.kind ?? base.kind,
+          status: 'running',
+          phase: 'queued',
+          attempt: d.attempt,
+          elapsedMs: 0,
+          lastAt: new Date(e.at).getTime(),
+        });
+      } else if (e.type === 'step_progress') {
+        map.set(e.stepIndex, {
+          ...base,
+          status: base.status === 'awaiting_approval' ? base.status : 'running',
+          phase: d.phase ?? base.phase,
+          detail: d.detail ?? base.detail,
+          attempt: d.attempt ?? base.attempt,
+          elapsedMs: Number(d.elapsedMs ?? base.elapsedMs),
+          lastAt: new Date(e.at).getTime(),
+        });
+      } else if (e.type === 'step_done') {
+        map.set(e.stepIndex, {
+          ...base,
+          status: d.status ?? 'passed',
+          phase: d.status === 'passed' ? 'done' : 'failed',
+          elapsedMs: base.elapsedMs,
+          lastAt: new Date(e.at).getTime(),
+        });
+      }
+    }
+
+    return Array.from(map.values()).sort((a, b) => a.index - b.index);
+  }, [task.steps, events]);
+
+  /** the newest server-computed progress snapshot (falls back to local) */
+  const progress = useMemo<ProgressCounts>(() => {
+    const last = [...events].reverse().find((e) => e.type === 'progress');
+    if (last?.data) {
+      const d = last.data as Partial<ProgressCounts>;
+      if (typeof d.total === 'number') return { ...localProgress([]), ...d } as ProgressCounts;
+    }
+    if (task.progress) return task.progress;
+    return localProgress(derived);
+  }, [events, task.progress, derived]);
+
+  const agents = derived.filter(
+    (d) => d.status === 'running' || d.status === 'awaiting_approval'
+  );
+  const queued = derived.filter((d) => d.status === 'pending').length;
+  const busyCount = agents.filter((a) => a.status === 'running').length;
+
+  return (
+    <div className="rounded-xl border border-sky-500/30 bg-sky-500/5 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Zap className="h-3.5 w-3.5 text-sky-300" />
+        <p className="text-xs font-semibold text-sky-200 flex-1">
+          ⚡ Live agents — {busyCount}/{parallelism} busy
+        </p>
+        <span className="text-[10px] text-zinc-400">
+          {progress.done}/{progress.total} steps · {progress.percent}%
+        </span>
+      </div>
+
+      <Progress value={progress.percent} className="h-1.5 mb-2" />
+
+      <div className="flex flex-wrap gap-1.5 mb-2 text-[10px]">
+        <span className="px-1.5 py-0.5 rounded bg-zinc-800/70 text-emerald-300">
+          ✅ {progress.passed} passed
+        </span>
+        {progress.running > 0 && (
+          <span className="px-1.5 py-0.5 rounded bg-zinc-800/70 text-sky-300">
+            ⏳ {progress.running} running
+          </span>
+        )}
+        {queued > 0 && (
+          <span className="px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-400">
+            · {queued} queued
+          </span>
+        )}
+        {progress.failed > 0 && (
+          <span className="px-1.5 py-0.5 rounded bg-zinc-800/70 text-red-300">
+            ❌ {progress.failed} failed
+          </span>
+        )}
+        {progress.skipped > 0 && (
+          <span className="px-1.5 py-0.5 rounded bg-zinc-800/70 text-zinc-400">
+            ⤳ {progress.skipped} skipped
+          </span>
+        )}
+      </div>
+
+      {agents.length === 0 ? (
+        <p className="text-[10px] text-zinc-500">
+          Koi agent abhi nahi chal raha — Run dabao ya paused task ko resume karo.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {agents.map((a) => {
+            const meta = PHASE_META[a.phase] ?? PHASE_META.queued;
+            const elapsed = a.elapsedMs + (a.lastAt ? Math.max(0, Date.now() - a.lastAt) : 0);
+            return (
+              <div
+                key={a.index}
+                className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-2 py-1.5"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px]">{STEP_KIND_META[a.kind]?.emoji ?? '🤖'}</span>
+                  <span className="text-[11px] text-zinc-200 flex-1 truncate">
+                    #{a.index} {a.title}
+                  </span>
+                  <span className={`text-[10px] ${meta.cls}`}>
+                    {meta.emoji} {a.status === 'awaiting_approval' ? 'Approval' : meta.label}
+                  </span>
+                  <span className="text-[10px] font-mono text-zinc-500 tabular-nums">
+                    {formatElapsed(elapsed)}
+                  </span>
+                </div>
+                {a.detail && (
+                  <p className="text-[10px] text-zinc-500 mt-0.5 truncate">
+                    {a.detail}
+                    {a.attempt ? ` · attempt ${a.attempt + 1}` : ''}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {editable && (
+        <div className="mt-2.5 pt-2 border-t border-sky-500/20 flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-zinc-400">Agents</span>
+            {[1, 2, 3, 4].map((n) => (
+              <button
+                key={n}
+                disabled={busy}
+                onClick={() => onParallelism(n)}
+                className={`h-5 w-5 rounded text-[10px] border ${
+                  parallelism === n
+                    ? 'bg-sky-600 border-sky-500 text-white'
+                    : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200'
+                } disabled:opacity-50`}
+                title={n === 1 ? 'Serial (ek waqt me ek agent)' : `${n} agents ek saath`}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+          <label className="flex items-center gap-1.5 text-[10px] text-zinc-400">
+            <Switch
+              checked={parallelWrites}
+              disabled={busy}
+              onCheckedChange={onParallelWrites}
+              className="scale-75"
+            />
+            Parallel writes (sirf disjoint scopes)
+          </label>
+          <span className="text-[10px] text-zinc-600">
+            Writes hamesha lock ke andar — overlap sirf thinking me.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AgenticPanel({
   provider,
   model,
@@ -189,6 +521,12 @@ export function AgenticPanel({
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [streamState, setStreamState] = useState<StreamState>('idle');
   const [perAgentModels, setPerAgentModels] = useState(false);
+  /** parallel execution: how many agents may work at the same time */
+  const [parallelism, setParallelism] = useState(3);
+  /** let writing steps with disjoint declared scopes overlap */
+  const [parallelWrites, setParallelWrites] = useState(true);
+  /** ticking clock for the live board's elapsed timers */
+  const [tick, setTick] = useState(0);
   const [routing, setRouting] = useState<Record<AgentRole, RoleAssignment>>(() =>
     defaultRouting(provider, model)
   );
@@ -259,6 +597,17 @@ export function AgenticPanel({
   useEffect(() => {
     timelineRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [liveEvents]);
+
+  // the live board shows a running timer — tick once per second while the
+  // task is active (no timer at all on a finished task)
+  const hasRunningStep =
+    (task?.steps ?? []).some((s) => s.status === 'running') ||
+    (task ? ['running', 'verifying', 'planning', 'awaiting_approval'].includes(task.status) : false);
+  useEffect(() => {
+    if (!hasRunningStep) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [hasRunningStep]);
 
   // ---------- realtime stream (reconnectable) ----------
 
@@ -424,6 +773,8 @@ export function AgenticPanel({
             ...(decision ? { decision, command } : {}),
             agentConfig: perAgentModels ? agentConfig : undefined,
             credentials,
+            parallelism,
+            parallelWrites,
           }),
         });
         if (!res.ok) {
@@ -438,7 +789,7 @@ export function AgenticPanel({
         setRunning(false);
       }
     },
-    [task, running, loadTask, loadTasks, agentConfig, credentials, perAgentModels]
+    [task, running, loadTask, loadTasks, agentConfig, credentials, perAgentModels, parallelism, parallelWrites]
   );
 
   /**
@@ -463,6 +814,8 @@ export function AgenticPanel({
             approvedCommands: approvedCommand ? [approvedCommand] : [],
             agentConfig: perAgentModels ? agentConfig : undefined,
             credentials,
+            parallelism,
+            parallelWrites,
           }),
         });
         if (!res.ok) {
@@ -477,7 +830,7 @@ export function AgenticPanel({
         setRunning(false);
       }
     },
-    [task, running, loadTask, loadTasks, agentConfig, credentials, perAgentModels]
+    [task, running, loadTask, loadTasks, agentConfig, credentials, perAgentModels, parallelism, parallelWrites]
   );
 
   const pauseTask = async () => {
@@ -831,6 +1184,17 @@ export function AgenticPanel({
         {task && (
           <ScrollArea className="flex-1 min-h-0">
             <div className="p-4 space-y-3">
+              <LiveBoard
+                task={task}
+                events={liveEvents}
+                tick={tick}
+                parallelism={parallelism}
+                parallelWrites={parallelWrites}
+                editable={!running && !['running', 'verifying'].includes(task.status)}
+                busy={running}
+                onParallelism={setParallelism}
+                onParallelWrites={setParallelWrites}
+              />
               <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
                 <p className="text-xs font-semibold text-emerald-300 mb-2">
                   📋 Plan ({task.plan.length} steps) — step {Math.min(task.currentStep + 1, task.plan.length)}
@@ -867,6 +1231,11 @@ export function AgenticPanel({
                             <span className="ml-1.5 text-[10px] text-sky-400">
                               ⛓ after {deps.join(', ')}
                             </span>
+                          )}
+                          {s.files && s.files.length > 0 && (
+                            <p className="text-[10px] text-violet-300/80 mt-0.5 font-mono truncate">
+                              ⚡ writes: {s.files.join(', ')}
+                            </p>
                           )}
                           {s.acceptance && (
                             <p className="text-zinc-500 text-[10px] mt-0.5">
@@ -1465,6 +1834,64 @@ function TimelineEvent({
           <span className={data?.decision === 'approved' ? 'text-emerald-300' : 'text-red-300'}>
             {data?.decision === 'approved' ? '👍 Approved' : '👎 Denied'}:{' '}
             <span className="font-mono">{data?.command}</span>
+          </span>
+        </div>
+      );
+    }
+    case 'wave_start': {
+      const data = d as
+        | {
+            wave?: { index: number; title: string; kind: string }[];
+            reason?: string;
+            limit?: number;
+            writers?: number;
+          }
+        | undefined;
+      const steps = data?.wave ?? [];
+      return (
+        <div className="flex items-start gap-2 text-xs">
+          <span className="text-zinc-600 font-mono text-[10px] mt-0.5">{at}</span>
+          <span className="text-sky-300">
+            <Zap className="h-3.5 w-3.5 inline mr-1" />
+            Wave: {steps.length} agent(s)
+            {steps.length > 1 ? ' parallel' : ''}
+            {data?.reason ? ` · ${WAVE_REASON_LABEL[data.reason] ?? data.reason}` : ''}
+            {data?.writers ? ` · ${data.writers} writer(s)` : ''}
+            <span className="text-zinc-500">
+              {' '}
+              {steps.map((s) => `#${s.index}`).join(', ')}
+            </span>
+          </span>
+        </div>
+      );
+    }
+    case 'step_progress': {
+      const data = d as
+        | { phase?: string; detail?: string; elapsedMs?: number; agent?: string }
+        | undefined;
+      const meta = PHASE_META[data?.phase ?? 'queued'] ?? PHASE_META.queued;
+      return (
+        <div className="flex items-start gap-2 text-xs">
+          <span className="text-zinc-600 font-mono text-[10px] mt-0.5">{at}</span>
+          <span className={`${meta.cls} text-[11px]`}>
+            {meta.emoji} {meta.label}
+            {data?.detail ? <span className="text-zinc-500"> — {data.detail}</span> : null}
+            {typeof data?.elapsedMs === 'number' ? (
+              <span className="text-zinc-600 font-mono"> ({formatElapsed(data.elapsedMs)})</span>
+            ) : null}
+          </span>
+        </div>
+      );
+    }
+    case 'progress': {
+      const data = d as ProgressCounts | undefined;
+      if (!data) return null;
+      return (
+        <div className="flex items-start gap-2 text-xs">
+          <span className="text-zinc-600 font-mono text-[10px] mt-0.5">{at}</span>
+          <span className="text-zinc-400 text-[11px]">
+            📊 Progress {data.percent}% — {data.passed} passed · {data.running} running ·{' '}
+            {data.pending} queued
           </span>
         </div>
       );

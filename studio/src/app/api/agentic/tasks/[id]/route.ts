@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { db } from '@/lib/db';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { isActiveStatus, normalizeTaskStatus } from '@/lib/agentic/types';
+import { computeProgress } from '@/lib/agentic/parallel';
 
 export const runtime = 'nodejs';
 
@@ -34,11 +35,15 @@ export async function GET(
       take: 200,
     });
 
+    const plan = JSON.parse(task.plan || '[]') as { index: number }[];
+
     return Response.json({
       id: task.id,
       prompt: task.prompt,
       status: task.status,
-      plan: JSON.parse(task.plan || '[]'),
+      plan,
+      /** live board: terminal/running/pending counts + percent */
+      progress: computeProgress(task.steps),
       currentStep: task.currentStep,
       steps: task.steps,
       report: task.report ? JSON.parse(task.report) : null,
