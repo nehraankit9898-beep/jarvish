@@ -241,12 +241,6 @@ export function SettingsDialog({
     if (saving) return;
     setSaving(true);
     const testPassed = testStates[selected] === 'success';
-    const signature = connectionSignature({
-      apiKey: draft.apiKey,
-      keyHint: saved?.keyHint,
-      model: draft.model,
-      baseUrl: draft.baseUrl,
-    });
     // 1) persist the configuration SERVER-SIDE (key encrypted, never echoed).
     let keyHint = saved?.keyHint ?? serverInfo?.keyHint ?? '';
     let serverStored = saved?.serverStored ?? serverInfo?.hasKey ?? false;
@@ -286,6 +280,17 @@ export function SettingsDialog({
       });
     }
 
+    // The verification signature must describe the configuration that is stored
+    // AFTER this save: a key that just moved to the server is identified by its
+    // hint, not by the raw value that produced the passing test.
+    const finalSignature = testPassed
+      ? connectionSignature({
+          apiKey: serverStored ? '' : draft.apiKey,
+          keyHint,
+          model: draft.model,
+          baseUrl: draft.baseUrl,
+        })
+      : undefined;
     updateConnection(selected, {
       // the secret does not stay in localStorage once the server has it
       apiKey: serverStored ? '' : draft.apiKey,
@@ -294,7 +299,7 @@ export function SettingsDialog({
       model: draft.model,
       baseUrl: draft.baseUrl,
       connected: testPassed,
-      testedSign: testPassed ? signature : undefined,
+      testedSign: finalSignature,
       testedAt: testPassed ? new Date().toISOString() : saved?.testedAt,
       lastError: testPassed ? undefined : saved?.lastError,
     });
@@ -343,7 +348,7 @@ export function SettingsDialog({
       if (json.ok) {
         const signature = connectionSignature({
           apiKey: draft.apiKey,
-          keyHint: saved?.keyHint,
+          keyHint: saved?.keyHint ?? serverInfo?.keyHint ?? '',
           model: draft.model,
           baseUrl: draft.baseUrl,
         });
@@ -426,7 +431,6 @@ export function SettingsDialog({
   };
 
   const testState = testStates[selected] ?? 'idle';
-  const isConnected = saved?.connected;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

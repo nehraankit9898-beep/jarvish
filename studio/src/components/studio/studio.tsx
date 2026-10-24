@@ -64,7 +64,7 @@ import { WorldPanel } from './world-panel';
 import { RemotePanel } from './remote-panel';
 import { NotificationsBell } from './notifications-bell';
 import { PROVIDERS, getProvider, resolveModel } from '@/lib/providers';
-import { consumeModelNotices, useConnections } from '@/lib/api-keys-store';
+import { consumeModelNotices, isVerified, useConnections } from '@/lib/api-keys-store';
 import { installTokenFetch } from '@/lib/api-token';
 import { toast } from '@/hooks/use-toast';
 import { ChatMessage, TypingIndicator, type ChatMessageData } from './chat-message';
@@ -1450,7 +1450,7 @@ export function Studio() {
                 >
                   {activeModel || 'default'}
                 </Badge>
-                {conn?.connected && (
+                {isVerified(conn) && (
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 )}
               </button>
@@ -1460,7 +1460,7 @@ export function Studio() {
                 <DropdownMenuItem
                   key={p.id}
                   onClick={() => {
-                    if (connections[p.id]?.connected || p.kind === 'zai' || p.id === 'ollama') {
+                    if (isVerified(connections[p.id]) || p.kind === 'zai' || p.id === 'ollama') {
                       switchProvider(p.id);
                       toast({ title: `${p.emoji} ${p.name} activated` });
                     } else {
@@ -1476,7 +1476,7 @@ export function Studio() {
                 >
                   <span>{p.emoji}</span>
                   <span className="flex-1">{p.name}</span>
-                  {connections[p.id]?.connected && (
+                  {isVerified(connections[p.id]) && (
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                   )}
                 </DropdownMenuItem>

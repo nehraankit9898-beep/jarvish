@@ -40,10 +40,8 @@ import {
 } from '@/components/ui/select';
 import { toast } from '@/hooks/use-toast';
 import { PROVIDERS, getProvider, type ProviderId } from '@/lib/providers';
-import type {
-  ConnectionConfig,
-  ConnectionsMap,
-} from '@/lib/api-keys-store';
+import { isVerified } from '@/lib/api-keys-store';
+import type { ConnectionConfig, ConnectionsMap } from '@/lib/api-keys-store';
 import type { useVoiceInput, useSpeechOutput, useWakeWord, VoiceLang } from '@/hooks/use-speech';
 import { ShieldCheck, Volume2, Radar, Route, ExternalLink } from 'lucide-react';
 
@@ -257,7 +255,7 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                   >
                     <span>{p.emoji}</span>
                     <span className="truncate flex-1">{p.name}</span>
-                    {(c?.connected || p.kind === 'zai' || p.id === 'ollama') && (
+                    {(isVerified(c) || p.kind === 'zai' || p.id === 'ollama') && (
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" aria-label="connected" />
                     )}
                     {p.free && (
@@ -275,8 +273,21 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                     <p className="text-sm font-medium text-zinc-100">{selInfo.emoji} {selInfo.name}</p>
                     <p className="text-[11px] text-zinc-500">{selInfo.description}</p>
                   </div>
-                  <Badge variant="outline" className={`text-[10px] ${selConn?.connected ? 'border-emerald-500/40 text-emerald-300' : 'border-zinc-700 text-zinc-500'}`}>
-                    {selConn?.connected ? 'connected' : 'not configured'}
+                  <Badge
+                    variant="outline"
+                    className={`text-[10px] ${
+                      isVerified(selConn)
+                        ? 'border-emerald-500/40 text-emerald-300'
+                        : selConn
+                          ? 'border-amber-500/40 text-amber-300'
+                          : 'border-zinc-700 text-zinc-500'
+                    }`}
+                  >
+                    {isVerified(selConn)
+                      ? 'connected'
+                      : selConn
+                        ? 'configured — not verified'
+                        : 'not configured'}
                   </Badge>
                 </div>
 

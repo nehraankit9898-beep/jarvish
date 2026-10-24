@@ -159,6 +159,7 @@ Each row is addressed in the sections below; every claim is backed by a test lis
 | A stale model id in the browser was rewritten silently | `loadConnections()` mutated the model | it now queues a `ModelMigrationNotice`; the app shell toasts **and speaks** "purana model X ab supported nahi hai, isliye Y set kar diya" |
 | Model list could be shown as live when it was static | one `models` array, no provenance | list carries `source: provider \| cache \| catalog`, `fetchedAt`, `cached`, `note`, `selectedNotice`; the UI labels it and marks free/legacy items |
 | Test Voice did nothing while muted | it called `speak()`, which respects mute | calls `testVoice()` (forces audio), shows the engine, the last spoken line and any error |
+| Other screens trusted the raw `connected` flag | compare panel, provider switcher, JARVIS AI-Brain badge | all now use `isVerified()`; a configuration that was never tested (or was edited after the test) is labelled **configured — not verified** |
 
 ---
 
@@ -198,6 +199,7 @@ studio/src/hooks/use-speech.ts                  default-on, testVoice, visible e
 studio/src/components/studio/studio.tsx         lifecycle speech, offline path, spoken failures
 studio/src/components/studio/settings-dialog.tsx verified state, server-side keys, live models
 studio/src/components/studio/providers-panel.tsx status badges, timestamps, provenance
+studio/src/components/studio/compare-panel.tsx    eligibility requires a verified configuration
 studio/src/components/jarvis/jarvis-dashboard.tsx voice banner + transcript
 studio/src/components/jarvis/jarvis-settings.tsx  Test Voice + error + last spoken
 ```
