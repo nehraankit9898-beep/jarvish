@@ -484,17 +484,24 @@ export function runToolCode(
   // denies filesystem writes, child processes, workers, addons and WASI in
   // this short-lived process; only the runner source itself is readable. If
   // the runtime cannot provide that isolation, execution fails closed.
-  const child = spawn(
-    nodeBinary,
-    [
-      '--experimental-permission',
-      `--allow-fs-read=${runner}`,
-      '--max-old-space-size=64',
-      '--max-semi-space-size=4',
-      runner,
-    ],
-    { env, shell: false, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }
-  );
+  // The argv is assembled with push() ON PURPOSE. A literal array at this call
+  // site makes the production bundler (Turbopack) treat `spawn(exe, [...])` as
+  // a dynamic module import and fail the build with
+  //   "Module not found: Can't resolve ('--experimental-permission' | <dynamic>)"
+  // — `next build` could not complete at all, so no distributable bundle (and
+  // no Windows installer) could be produced. Same argv, same isolation.
+  const runnerArgs: string[] = [];
+  runnerArgs.push('--experimental-permission');
+  runnerArgs.push(`--allow-fs-read=${runner}`);
+  runnerArgs.push('--max-old-space-size=64');
+  runnerArgs.push('--max-semi-space-size=4');
+  runnerArgs.push(runner);
+  const child = spawn(nodeBinary, runnerArgs, {
+    env,
+    shell: false,
+    windowsHide: true,
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
 
   return new Promise<unknown>((resolve, reject) => {
     let settled = false;

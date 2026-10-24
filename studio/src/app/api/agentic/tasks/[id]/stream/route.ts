@@ -101,6 +101,17 @@ export async function GET(
 
       let currentStatus = normalizeTaskStatus(task.status);
 
+      // Flush the response IMMEDIATELY with an SSE comment.
+      //
+      // Without this the handler enqueued nothing until an event existed, so
+      // the HTTP response headers were never sent: `fetch()` (and EventSource)
+      // stayed unresolved, the dashboard's status pill sat on "connecting"
+      // for the whole quiet period between two steps, and a proxy in between
+      // saw a request that produced no bytes at all. A comment line is ignored
+      // by the SSE parser and only exists to open the channel.
+      send(': connected\n\n');
+
+      let quietPolls = 0;
       try {
         while (!closed) {
           // replay/poll everything newer than `after`
@@ -126,6 +137,16 @@ export async function GET(
           if (isTerminalStatus(currentStatus)) {
             terminalFrame(currentStatus);
             break;
+          }
+
+          // keep-alive: a task can legitimately emit nothing for minutes
+          // (waiting for an approval, a long test run). One comment per ~15 s
+          // keeps the connection observably alive without waking the client's
+          // event handlers.
+          quietPolls += 1;
+          if (quietPolls >= 15) {
+            quietPolls = 0;
+            send(': ping\n\n');
           }
 
           // wait for more events (the abort listener flips `closed` on

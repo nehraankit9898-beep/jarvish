@@ -14,3 +14,5 @@ db/*.sqlite-journal
 .agentic-workspace
 coverage
 .DS_Store
+# distributable archives built by tools/build-release.sh
+release/

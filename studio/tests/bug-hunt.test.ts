@@ -32,6 +32,7 @@ import {
   startScheduleRun,
 } from '../src/lib/agentic/automation';
 import { CommandDeniedError, executeCommand } from '../src/lib/agentic/terminal';
+import { createWorkspace, removeWorkspace } from '../src/lib/agentic/workspace';
 import { checkCommand } from '../src/lib/agentic/permissions';
 import { classifyHostAction } from '../src/lib/agentic/host-control';
 import { scanToolCode } from '../src/lib/agentic/custom-tools';
@@ -162,21 +163,36 @@ describe('H6 — duplicate-run guard keeps its claim while a run is starting', (
 // H7 / H15 — classification must see the raw payload
 // ---------------------------------------------------------------------------
 describe('H7 — shell payloads are classified before any whitespace folding', () => {
+  // A REAL newline (a shell command separator), not the two-character \n:
+  // the old bug was that `normalizeCommand` folded the newline into a space,
+  // so a two-line payload was classified by its harmless first line only.
+  const multiLine = ['echo hi', 'rm -rf ./build'].join('\n');
+
   test('the classifier itself still escalates a multi-line payload', () => {
-    expect(checkCommand('echo hi\nrm -rf ./build').permission).toBe('destructive');
-    expect(checkCommand('echo hi\necho there').permission).toBe('safe');
+    expect(multiLine).toContain('\n');
+    expect(checkCommand(multiLine).permission).toBe('destructive');
+    expect(checkCommand(['echo hi', 'echo there'].join('\n')).permission).toBe('safe');
   });
 
   test('executeCommand refuses the multi-line payload instead of auto-running it', async () => {
-    // 'echo hi\nrm -rf ./build' normalized to ONE line reads as a plain echo —
-    // the old code classified that folded form and reported permission 'safe'
-    const p = await executeCommand('task-h7', 'echo hi\nrm -rf ./build').catch((e) => e);
-    expect(p).toBeInstanceOf(CommandDeniedError);
-    expect((p as CommandDeniedError).permission).toBe('destructive');
+    // The workspace is created HERE. Without it `assertWorkspaceCommand`
+    // answers "workspace is not ready" (permission 'forbidden'), so this test
+    // only passed when a leftover `.agentic-workspace/task-h7` from an earlier
+    // full-suite run happened to exist — it was order- and state-dependent and
+    // failed on a clean checkout.
+    const taskId = `task-h7-${Date.now().toString(36)}`;
+    await createWorkspace(taskId);
+    try {
+      const p = await executeCommand(taskId, multiLine).catch((e) => e);
+      expect(p).toBeInstanceOf(CommandDeniedError);
+      expect((p as CommandDeniedError).permission).toBe('destructive');
+    } finally {
+      await removeWorkspace(taskId).catch(() => undefined);
+    }
   });
 
   test('host exec classification escalates a multi-line payload too', () => {
-    const cls = classifyHostAction({ kind: 'exec', command: 'echo hi\nrm -rf ./build' });
+    const cls = classifyHostAction({ kind: 'exec', command: multiLine });
     expect(cls.permission).toBe('destructive');
     const benign = classifyHostAction({ kind: 'exec', command: 'ls -la' });
     expect(benign.permission).toBe('review');

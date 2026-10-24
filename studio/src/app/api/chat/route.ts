@@ -8,6 +8,7 @@ import {
   type CoreChatMessage,
 } from '@/lib/llm-core';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
+import { protect } from '@/lib/agentic/secrets';
 import { isCapabilityQuestion, JARVIS_CAPABILITIES_PROMPT } from '@/lib/agentic/jarvis';
 import {
   buildPersonaDirective,
@@ -235,10 +236,50 @@ Rules for this protocol:
         return new Response(null, { status: 499 });
       }
       console.error('[chat] upstream connection failed:', err);
-      return new Response(JSON.stringify({ error: 'Unable to reach the model provider.' }), {
-        status: 502,
-        headers: { 'Content-Type': 'application/json' },
-      });
+
+      // NAME THE ACTUAL FAILURE. Everything used to collapse into
+      // "Unable to reach the model provider" with a 502 — including a 401 for a
+      // wrong API key, a 404 for a retired model and a provider 5xx. The user
+      // was told the network was down while the provider was answering
+      // perfectly well, and the fix (rotate the key / pick another model) was
+      // never suggested. Provider status is mapped back to the caller; the
+      // provider's own body is masked before it can reach the browser.
+      const providerText = protect(
+        err instanceof Error ? err.message : 'unknown error'
+      ).masked.slice(0, 300);
+      const failure = (status: number, error: string, errorCategory: string) =>
+        new Response(
+          JSON.stringify({ error, errorCategory, provider: providerId, model: usedModel }),
+          {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      if (parsed.status === 401 || parsed.status === 403) {
+        return failure(
+          401,
+          `The provider rejected the API key (${parsed.status}). Check the key for "${providerId}" in Settings → API.`,
+          'auth'
+        );
+      }
+      if (parsed.status === 404) {
+        return failure(
+          404,
+          `The provider does not offer the model "${usedModel}". Pick another model in Settings → API.`,
+          'config'
+        );
+      }
+      if (parsed.status === 400 || parsed.status === 422) {
+        return failure(400, `The provider rejected the request: ${providerText}`, 'config');
+      }
+      if (typeof parsed.status === 'number' && parsed.status >= 500) {
+        return failure(502, `The provider is failing (HTTP ${parsed.status}). Try again shortly.`, 'server');
+      }
+      return failure(
+        502,
+        `Unable to reach the model provider (${providerText}).`,
+        'network'
+      );
     }
     const upstreamMs = Date.now() - upstreamOpenedAt;
 

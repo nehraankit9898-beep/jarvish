@@ -6,6 +6,7 @@ import { listProviderConfigs, readStudioSettings } from '@/lib/agentic/provider-
 import { listTools, healthCheckTool } from '@/lib/agentic/tool-registry';
 import { ensureFullToolCatalog } from '@/lib/agentic/tool-catalog';
 import { validateEnv } from '@/lib/agentic/env';
+import { retentionStatus } from '@/lib/agentic/retention';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -200,5 +201,7 @@ export async function GET(req: NextRequest) {
       platform: process.platform,
       cwd: process.cwd(),
     },
+    // opt-in cleanup policy (AGENTSCOPE_RETENTION_DAYS=0/unset → disabled)
+    retention: retentionStatus(),
   });
 }

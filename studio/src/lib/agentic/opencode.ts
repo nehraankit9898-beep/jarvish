@@ -32,6 +32,67 @@ export interface OpenCodeTaskResult {
 
 let activeProcesses = new Map<string, ChildProcess>();
 
+/**
+ * The child environment for the OpenCode CLI.
+ *
+ * SECURITY: this used to be `{ ...process.env }`, which handed the Studio's own
+ * secrets — AGENTSCOPE_SECRET_KEY (the AES key for every stored provider key),
+ * AGENTSCOPE_API_TOKEN, DATABASE_URL and any key exported in the shell — to an
+ * LLM-driven agent that runs commands inside the workspace. "Print your
+ * environment" or a `env` call is enough to push them into a chat transcript
+ * and out to a third-party model. Every other process spawner in this codebase
+ * (terminal.ts `sanitizedEnv`, host-control `hostEnv`, desktop-bridge
+ * `bridgeEnv`) already strips them; this one now does the same, and adds back
+ * ONLY the provider key the caller explicitly passed for the run.
+ */
+function openCodeEnv(config: OpenCodeConfig): NodeJS.ProcessEnv {
+  const allow = [
+    'PATH',
+    'HOME',
+    'USER',
+    'USERNAME',
+    'LOGNAME',
+    'SHELL',
+    'LANG',
+    'LC_ALL',
+    'TERM',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+    // where OpenCode keeps its own config/cache
+    'XDG_CONFIG_HOME',
+    'XDG_CACHE_HOME',
+    'XDG_DATA_HOME',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'USERPROFILE',
+    'SystemRoot',
+    'SYSTEMROOT',
+    'COMSPEC',
+    'PATHEXT',
+    // outbound proxies, if the operator needs one
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'no_proxy',
+  ];
+  const env: NodeJS.ProcessEnv = {} as NodeJS.ProcessEnv;
+  for (const key of allow) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  // The key the CALLER passed for this run (never the Studio's stored ones).
+  if (config.apiKey) {
+    env.OPENAI_API_KEY = config.apiKey;
+    env.ANTHROPIC_API_KEY = config.apiKey;
+    env.OPENROUTER_API_KEY = config.apiKey;
+  }
+  if (config.baseUrl) env.OPENAI_BASE_URL = config.baseUrl;
+  return env;
+}
+
 export async function detectOpenCode(config?: OpenCodeConfig): Promise<OpenCodeStatus> {
   const candidates = [
     config?.executablePath,
@@ -47,6 +108,7 @@ export async function detectOpenCode(config?: OpenCodeConfig): Promise<OpenCodeS
   for (const candidate of candidates) {
     try {
       const proc = spawn(candidate, ['--version'], {
+        env: openCodeEnv(config ?? {}),
         shell: false,
       });
       let output = '';
@@ -88,13 +150,7 @@ export async function executeOpenCodeTask(
   if (config.provider) args.push('--provider', config.provider);
   if (config.model) args.push('--model', config.model);
   args.push(prompt);
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (config.apiKey) {
-    env.OPENAI_API_KEY = config.apiKey;
-    env.ANTHROPIC_API_KEY = config.apiKey;
-    env.OPENROUTER_API_KEY = config.apiKey;
-  }
-  if (config.baseUrl) env.OPENAI_BASE_URL = config.baseUrl;
+  const env = openCodeEnv(config);
   const proc = spawn(status.executablePath, args, { cwd: workspacePath, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
   activeProcesses.set(taskId, proc);
   proc.stdout?.on('data', (data) => {
