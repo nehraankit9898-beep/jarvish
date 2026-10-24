@@ -129,11 +129,20 @@ export async function GET(
   if (denied) return denied;
   const { id } = await params;
   const { searchParams } = new URL(req.url);
+
+  // API keys in query strings leak into browser history, proxy/access logs and
+  // monitoring traces. Unsaved credentials must be sent with POST instead.
+  if (searchParams.has('apiKey')) {
+    return Response.json(
+      { error: 'Do not send API keys in a URL; use POST with a JSON body.' },
+      { status: 400 }
+    );
+  }
+
   return respond(id, {
     refresh: searchParams.get('refresh') === '1',
     includeAll: searchParams.get('all') === '1',
     model: searchParams.get('model') ?? undefined,
-    apiKey: searchParams.get('apiKey') ?? undefined,
     baseUrl: searchParams.get('baseUrl') ?? undefined,
   });
 }
@@ -153,14 +162,36 @@ export async function POST(
   if (denied) return denied;
   const { id } = await params;
   let body: Record<string, unknown> = {};
-  try {
-    const parsed = await req.json();
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+  const raw = await req.text().catch(() => '');
+  if (raw.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return Response.json({ error: 'Request body must be a JSON object.' }, { status: 400 });
+      }
       body = parsed as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: 'Invalid JSON body.' }, { status: 400 });
     }
-  } catch {
-    // an empty body is fine — the stored credential is used
   }
+
+  const stringFields = ['apiKey', 'baseUrl', 'model'] as const;
+  for (const field of stringFields) {
+    const value = body[field];
+    if (value !== undefined && typeof value !== 'string') {
+      return Response.json({ error: `${field} must be a string.` }, { status: 400 });
+    }
+  }
+  if (typeof body.apiKey === 'string' && body.apiKey.length > 8192) {
+    return Response.json({ error: 'apiKey is too long.' }, { status: 400 });
+  }
+  if (typeof body.baseUrl === 'string' && body.baseUrl.length > 2048) {
+    return Response.json({ error: 'baseUrl is too long.' }, { status: 400 });
+  }
+  if (typeof body.model === 'string' && body.model.length > 256) {
+    return Response.json({ error: 'model is too long.' }, { status: 400 });
+  }
+
   const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
   return respond(id, {
     refresh: body.refresh === true,
