@@ -19,7 +19,7 @@
  * unavailable state (e.g. mic unsupported, voice bridge offline).
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { JarvisReactor, type JarvisVisualState } from './jarvis-reactor';
 import {
@@ -42,6 +42,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/hooks/use-toast';
+import { usePolling } from '@/hooks/use-polling';
 import type { ChatMessageData } from '../studio/chat-message';
 import type { useVoiceInput, useSpeechOutput, useWakeWord, VoiceLang } from '@/hooks/use-speech';
 
@@ -255,11 +256,11 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
   const [voiceBridgeReady, setVoiceBridgeReady] = useState<boolean | null>(null);
   const [audit, setAudit] = useState<AuditRow[]>([]);
 
-  const refreshSystem = useCallback(async () => {
+  const refreshSystem = useCallback(async (signal?: AbortSignal) => {
     try {
       const [s, h] = await Promise.all([
-        fetch('/api/system/status').then((r) => (r.ok ? r.json() : null)),
-        fetch('/api/health').then((r) => (r.ok ? r.json() : null)),
+        fetch('/api/system/status', { signal }).then((r) => (r.ok ? r.json() : null)),
+        fetch('/api/health', { signal }).then((r) => (r.ok ? r.json() : null)),
       ]);
       if (s) setSystem(s as SystemSnapshot);
       if (h) setHealth(h as HealthSnapshot);
@@ -268,9 +269,9 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
     }
   }, []);
 
-  const refreshProviders = useCallback(async () => {
+  const refreshProviders = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/providers');
+      const res = await fetch('/api/providers', { signal });
       if (res.ok) {
         const data = (await res.json()) as { providers?: ProviderDto[] };
         setProviders(data.providers ?? []);
@@ -280,15 +281,15 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
     }
   }, []);
 
-  const refreshHost = useCallback(async () => {
+  const refreshHost = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/host');
+      const res = await fetch('/api/host', { signal });
       if (res.ok) {
         const data = (await res.json()) as { mode?: string; pending?: HostPending[] };
         setHostMode(data.mode ?? '');
         setHostPending(data.pending ?? []);
       }
-      const lap = await fetch('/api/laptop');
+      const lap = await fetch('/api/laptop', { signal });
       if (lap.ok) {
         const data = (await lap.json()) as { killed?: boolean; voice?: { ready?: boolean } };
         setKilled(Boolean(data.killed));
@@ -299,31 +300,21 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
     }
   }, []);
 
-  const refreshAudit = useCallback(async () => {
+  const refreshAudit = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/audit?limit=10');
+      const res = await fetch('/api/audit?limit=10', { signal });
       if (res.ok) setAudit((await res.json()) as AuditRow[]);
     } catch {
       /* keep last */
     }
   }, []);
 
-  useEffect(() => {
-    refreshSystem();
-    refreshProviders();
-    refreshHost();
-    refreshAudit();
-    const t1 = setInterval(refreshSystem, 60_000);
-    const t2 = setInterval(refreshProviders, 30_000);
-    const t3 = setInterval(refreshHost, 5_000);
-    const t4 = setInterval(refreshAudit, 30_000);
-    return () => {
-      clearInterval(t1);
-      clearInterval(t2);
-      clearInterval(t3);
-      clearInterval(t4);
-    };
-  }, [refreshSystem, refreshProviders, refreshHost, refreshAudit]);
+  // Same cadences as before — but hidden-tab ticks are skipped, slow runs
+  // never overlap, and leaving the screen aborts the in-flight refresh.
+  usePolling(refreshSystem, 60_000);
+  usePolling(refreshProviders, 30_000);
+  usePolling(refreshHost, 5_000);
+  usePolling(refreshAudit, 30_000);
 
   /* ---- current task: pick the active one (or the selected one) ---- */
   const activeTaskItem = useMemo(() => {
@@ -432,7 +423,18 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
 
   /* ---- transcript autoscroll ---- */
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    // Follow the stream only when the user is already at the bottom (never
+    // yank them away from scrolled-up history), and don't re-trigger an
+    // animated scroll on every chunk while streaming (jank on weak GPUs).
+    const box = logRef.current;
+    if (box) {
+      const gap = box.scrollHeight - box.scrollTop - box.clientHeight;
+      if (gap > 120) return;
+    }
+    transcriptEndRef.current?.scrollIntoView({
+      behavior: streaming ? 'auto' : 'smooth',
+      block: 'end',
+    });
   }, [messages, streaming, voice.interim]);
 
   /* ---- task actions (same payloads as agentic-panel) ---- */
@@ -802,31 +804,12 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
               )}
               <div className="space-y-2 py-1">
                 {messages.map((m, i) => (
-                  <div key={m.id} className="text-xs leading-relaxed">
-                    {m.role === 'user' ? (
-                      <p className="text-zinc-400">
-                        <span className="font-mono text-[10px] tracking-widest text-cyan-500 mr-2">YOU ▸</span>
-                        <span className="break-words">{m.content}</span>
-                      </p>
-                    ) : (
-                      <div className="text-zinc-200">
-                        <span className={`font-mono text-[10px] tracking-widest mr-2 ${state === 'error' ? 'text-red-400' : 'text-cyan-300'}`}>JARVIS ▸</span>
-                        <div className="inline-block align-top max-w-full break-words [&_p]:inline [&_code]:text-cyan-200 [&_code]:bg-cyan-500/10 [&_code]:px-1 [&_code]:rounded [&_pre]:my-1 [&_pre]:bg-black/50 [&_pre]:border [&_pre]:border-zinc-800 [&_pre]:rounded-lg [&_pre]:p-2 [&_pre]:text-[10px] [&_pre_code]:bg-transparent">
-                          <ReactMarkdown
-                            components={{
-                              a: ({ children, href }) => (
-                                <a href={href} target="_blank" rel="noreferrer" className="text-cyan-300 underline">
-                                  {children}
-                                </a>
-                              ),
-                            }}
-                          >
-                            {m.content || (streaming && i === messages.length - 1 ? '…' : '')}
-                          </ReactMarkdown>
-                        </div>
-                      </div>
-                    )}
-                  </div>
+                  <TranscriptLine
+                    key={m.id}
+                    message={m}
+                    streamingTail={streaming && i === messages.length - 1}
+                    errorState={state === 'error'}
+                  />
                 ))}
                 {streaming && <TypingDots />}
                 <div ref={transcriptEndRef} />
@@ -952,6 +935,49 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
 }
 
 /* ------------------------------- small parts ------------------------------ */
+
+const TRANSCRIPT_LINK = {
+  a: ({ children, href }: { children?: React.ReactNode; href?: string }) => (
+    <a href={href} target="_blank" rel="noreferrer" className="text-cyan-300 underline">
+      {children}
+    </a>
+  ),
+};
+
+/**
+ * One transcript row. Memoized: a stream flush replaces ONLY the last
+ * message object, so every older row skips its markdown re-parse — without
+ * this, each chunk re-parsed the whole conversation (O(n·m) on an i3).
+ */
+const TranscriptLine = memo(function TranscriptLine({
+  message,
+  streamingTail,
+  errorState,
+}: {
+  message: ChatMessageData;
+  streamingTail: boolean;
+  errorState: boolean;
+}) {
+  return (
+    <div className="text-xs leading-relaxed">
+      {message.role === 'user' ? (
+        <p className="text-zinc-400">
+          <span className="font-mono text-[10px] tracking-widest text-cyan-500 mr-2">YOU ▸</span>
+          <span className="break-words">{message.content}</span>
+        </p>
+      ) : (
+        <div className="text-zinc-200">
+          <span className={`font-mono text-[10px] tracking-widest mr-2 ${errorState ? 'text-red-400' : 'text-cyan-300'}`}>JARVIS ▸</span>
+          <div className="inline-block align-top max-w-full break-words [&_p]:inline [&_code]:text-cyan-200 [&_code]:bg-cyan-500/10 [&_code]:px-1 [&_code]:rounded [&_pre]:my-1 [&_pre]:bg-black/50 [&_pre]:border [&_pre]:border-zinc-800 [&_pre]:rounded-lg [&_pre]:p-2 [&_pre]:text-[10px] [&_pre_code]:bg-transparent">
+            <ReactMarkdown components={TRANSCRIPT_LINK}>
+              {message.content || (streamingTail ? '…' : '')}
+            </ReactMarkdown>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
 
 function Meter({ label, value, note }: { label: string; value: number; note?: string }) {
   return (

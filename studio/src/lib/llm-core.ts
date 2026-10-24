@@ -85,11 +85,27 @@ export interface LLMConfig {
    * stall the whole orchestration.
    */
   timeoutMs?: number;
+  /**
+   * Optional caller abort (e.g. the chat route's request signal, so the
+   * user's Stop button also stops the upstream provider call instead of
+   * leaving it running server-side). Combined with the timeout — whichever
+   * fires first wins. Cancelling the returned stream releases the upstream
+   * connection as well.
+   */
+  signal?: AbortSignal;
 }
 
 // ---------- SSE parsers (moved from chat route, unchanged logic) ----------
 
-function sseChunksFromOpenAI(response: Response): ReadableStream<string> {
+/**
+ * `release` drops the upstream HTTP connection (called when the consumer
+ * cancels the stream — e.g. the user pressed Stop — so the provider socket
+ * is not left dangling until GC). A normally-completed stream never calls
+ * it, which keeps the pooled keep-alive connection reusable.
+ */
+type UpstreamRelease = () => void;
+
+function sseChunksFromOpenAI(response: Response, release?: UpstreamRelease): ReadableStream<string> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -121,12 +137,21 @@ function sseChunksFromOpenAI(response: Response): ReadableStream<string> {
       }
     },
     cancel() {
-      reader.cancel();
+      try {
+        void reader.cancel();
+      } catch {
+        /* already closed */
+      }
+      try {
+        release?.();
+      } catch {
+        /* ignore */
+      }
     },
   });
 }
 
-function sseChunksFromAnthropic(response: Response): ReadableStream<string> {
+function sseChunksFromAnthropic(response: Response, release?: UpstreamRelease): ReadableStream<string> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -155,12 +180,21 @@ function sseChunksFromAnthropic(response: Response): ReadableStream<string> {
       }
     },
     cancel() {
-      reader.cancel();
+      try {
+        void reader.cancel();
+      } catch {
+        /* already closed */
+      }
+      try {
+        release?.();
+      } catch {
+        /* ignore */
+      }
     },
   });
 }
 
-function sseChunksFromGemini(response: Response): ReadableStream<string> {
+function sseChunksFromGemini(response: Response, release?: UpstreamRelease): ReadableStream<string> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -190,7 +224,16 @@ function sseChunksFromGemini(response: Response): ReadableStream<string> {
       }
     },
     cancel() {
-      reader.cancel();
+      try {
+        void reader.cancel();
+      } catch {
+        /* already closed */
+      }
+      try {
+        release?.();
+      } catch {
+        /* ignore */
+      }
     },
   });
 }
@@ -238,7 +281,8 @@ export const ZAI_NOT_CONFIGURED =
 
 async function streamFromZai(
   messages: CoreChatMessage[],
-  temperature: number
+  temperature: number,
+  signal?: AbortSignal
 ): Promise<ReadableStream<string>> {
   const ZAI = (await import('z-ai-web-dev-sdk')).default;
   const zai = await ZAI.create();
@@ -255,6 +299,12 @@ async function streamFromZai(
   const iterator = simulateStream(String(content));
   return new ReadableStream({
     async pull(controller) {
+      // the Z.ai SDK takes no abort signal — but the simulated replay must
+      // still stop promptly when the caller went away (user pressed Stop)
+      if (signal?.aborted) {
+        controller.close();
+        return;
+      }
       const { value, done } = await iterator.next();
       if (done) controller.close();
       else controller.enqueue(value);
@@ -295,7 +345,7 @@ export async function buildUpstreamStream(
     // to the OpenAI-compatible Z.ai API (same endpoint, plain API key) so a
     // configured key is enough to run the whole agentic engine.
     if (hasZaiSdkConfig()) {
-      return streamFromZai(messages, temperature);
+      return streamFromZai(messages, temperature, config.signal);
     }
     if (!apiKey) {
       throw new Error(ZAI_NOT_CONFIGURED);
@@ -304,6 +354,24 @@ export async function buildUpstreamStream(
       throw new Error('Z.ai base URL is required when no .z-ai-config file is present.');
     }
   }
+
+  // One upstream call = one timeout + the caller's abort (user Stop) + our
+  // own release switch (stream cancel). Whichever fires first wins; a
+  // normally-completed stream aborts nothing, so the pooled keep-alive
+  // connection stays reusable. (Node's global fetch already pools
+  // connections per origin — no custom agent needed.)
+  const cancelUpstream = new AbortController();
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const upstreamSignal = config.signal
+    ? AbortSignal.any([timeoutSignal, config.signal, cancelUpstream.signal])
+    : AbortSignal.any([timeoutSignal, cancelUpstream.signal]);
+  const release = () => {
+    try {
+      cancelUpstream.abort();
+    } catch {
+      /* already settled */
+    }
+  };
 
   if (provider.kind === 'openai-compatible' || provider.kind === 'zai') {
     if (!baseUrl) throw new Error('Base URL is required for custom provider');
@@ -322,7 +390,7 @@ export async function buildUpstreamStream(
         temperature,
         stream: true,
       }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: upstreamSignal,
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
@@ -330,7 +398,7 @@ export async function buildUpstreamStream(
         apiErrorMessage(res, errText)
       );
     }
-    return sseChunksFromOpenAI(res);
+    return sseChunksFromOpenAI(res, release);
   }
 
   if (provider.kind === 'anthropic') {
@@ -355,7 +423,7 @@ export async function buildUpstreamStream(
           content: anthropicContent(m),
         })),
       }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: upstreamSignal,
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
@@ -363,7 +431,7 @@ export async function buildUpstreamStream(
         apiErrorMessage(res, errText)
       );
     }
-    return sseChunksFromAnthropic(res);
+    return sseChunksFromAnthropic(res, release);
   }
 
   // gemini
@@ -386,7 +454,7 @@ export async function buildUpstreamStream(
         : {}),
       generationConfig: { temperature },
     }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: upstreamSignal,
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -394,7 +462,7 @@ export async function buildUpstreamStream(
       apiErrorMessage(res, errText)
     );
   }
-  return sseChunksFromGemini(res);
+  return sseChunksFromGemini(res, release);
 }
 
 /**
@@ -427,4 +495,61 @@ export function apiErrorMessage(res: Response, errText: string): string {
   const retryAfter = res.status === 429 ? res.headers.get('retry-after')?.trim() : '';
   const hint = retryAfter && /^\d+(\.\d+)?$/.test(retryAfter) ? ` [retry-after=${retryAfter}s]` : '';
   return `API error ${res.status}${hint}: ${errText.slice(0, 300) || res.statusText}`;
+}
+
+export interface ParsedApiError {
+  /** HTTP status from "API error <status>", or null when not parseable */
+  status: number | null;
+  /** provider Retry-After in seconds (429 only), or null when absent */
+  retryAfterSec: number | null;
+}
+
+/**
+ * Parse what apiErrorMessage() produced — lets the chat route turn a 429
+ * into a real 429 (with the provider's own retry hint) instead of a flat
+ * 502, without touching the model router's classification.
+ */
+export function parseApiError(message: unknown): ParsedApiError {
+  const text = message instanceof Error ? message.message : String(message ?? '');
+  const statusMatch = /API error (\d{3})/i.exec(text);
+  const retryMatch = /retry-after=(\d+(?:\.\d+)?)s/i.exec(text);
+  return {
+    status: statusMatch ? parseInt(statusMatch[1], 10) : null,
+    retryAfterSec: retryMatch ? parseFloat(retryMatch[1]) : null,
+  };
+}
+
+export interface HistoryCap {
+  /** max messages to keep (newest first) */
+  maxMessages?: number;
+  /** max total characters across the kept messages */
+  maxChars?: number;
+}
+
+/**
+ * Bound the conversation history sent to the model: newest messages first,
+ * up to `maxMessages` AND `maxChars` total. The newest message (the current
+ * question) ALWAYS survives, even if it alone exceeds the char budget —
+ * dropping the actual question would be worse than a long prompt.
+ *
+ * Why both caps: 40 short messages are fine, but 40 long code dumps make a
+ * prompt of 100k+ chars (slow + expensive + slow TTFT on every provider).
+ */
+export function capHistoryContext<T extends { content: string }>(
+  history: T[],
+  cap: HistoryCap = {}
+): T[] {
+  const maxMessages = Math.max(1, cap.maxMessages ?? 40);
+  const maxChars = Math.max(1, cap.maxChars ?? 24_000);
+  const tail = history.slice(-maxMessages);
+  const kept: T[] = [];
+  let chars = 0;
+  for (let i = tail.length - 1; i >= 0; i--) {
+    const m = tail[i];
+    const len = m.content?.length ?? 0;
+    if (kept.length > 0 && chars + len > maxChars) break;
+    kept.push(m);
+    chars += len;
+  }
+  return kept.reverse();
 }

@@ -282,6 +282,9 @@ export function JarvisReactor({
         alpha: number,
       ) => {
         const rot = tSec * speed * (1 + energy * 3);
+        // constant per ring — hoisted (was: 116 style allocs per frame)
+        ctx.strokeStyle = rgba(cur, alpha);
+        ctx.lineWidth = 1.4;
         for (let i = 0; i < count; i++) {
           const a = rot + (i / count) * Math.PI * 2;
           const x1 = cx + Math.cos(a) * radius * R;
@@ -291,8 +294,6 @@ export function JarvisReactor({
           ctx.beginPath();
           ctx.moveTo(x1, y1);
           ctx.lineTo(x2, y2);
-          ctx.strokeStyle = rgba(cur, alpha);
-          ctx.lineWidth = 1.4;
           ctx.stroke();
         }
       };
@@ -385,6 +386,8 @@ export function JarvisReactor({
       ctx.ellipse(cx, fy, fRx, fRy, 0, 0, Math.PI * 2);
       ctx.stroke();
       const fRot = tSec * 0.1;
+      ctx.strokeStyle = rgba(cur, 0.22);
+      ctx.lineWidth = 1;
       for (let i = 0; i < 36; i++) {
         const a = fRot + (i / 36) * Math.PI * 2;
         const x = cx + Math.cos(a) * fRx * 1.06;
@@ -394,8 +397,6 @@ export function JarvisReactor({
         ctx.beginPath();
         ctx.moveTo(x, y);
         ctx.lineTo(x2, y2);
-        ctx.strokeStyle = rgba(cur, 0.22);
-        ctx.lineWidth = 1;
         ctx.stroke();
       }
 

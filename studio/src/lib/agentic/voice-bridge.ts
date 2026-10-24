@@ -306,7 +306,7 @@ export interface VoiceCallResult {
 export async function voiceCall(
   endpoint: '/ping' | '/status' | '/tts' | '/wake',
   payload: Record<string, unknown> = {},
-  opts: { raw?: boolean; timeoutMs?: number } = {}
+  opts: { raw?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}
 ): Promise<VoiceCallResult> {
   if (!voiceEnabled()) {
     return { ok: false, error: 'Voice bridge disabled (AGENTSCOPE_VOICE_BRIDGE=0)' };
@@ -327,6 +327,10 @@ export async function voiceCall(
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
+    // The caller's abort (e.g. user interrupted speech) wins over the timeout.
+    const signal = opts.signal
+      ? AbortSignal.any([controller.signal, opts.signal])
+      : controller.signal;
     const res = await fetch(url, {
       method: endpoint === '/ping' || endpoint === '/status' ? 'GET' : 'POST',
       headers: {
@@ -334,7 +338,7 @@ export async function voiceCall(
         'X-Desktop-Token': desktopToken(),
       },
       body: endpoint === '/ping' || endpoint === '/status' ? undefined : JSON.stringify(payload),
-      signal: controller.signal,
+      signal,
     });
     clearTimeout(timeout);
 

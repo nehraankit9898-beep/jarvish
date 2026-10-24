@@ -67,13 +67,15 @@ import { ChatMessage, TypingIndicator, type ChatMessageData } from './chat-messa
 import type { AgentCreatePayload } from './agent-create-card';
 import { SettingsDialog } from './settings-dialog';
 import { AgentDialog, type AgentData } from './agent-dialog';
-import { useVoiceInput, useSpeechOutput, useWakeWord, type VoiceLang } from '@/hooks/use-speech';
+import { useVoiceInput, useSpeechOutput, useWakeWord, type SentenceChain, type VoiceLang } from '@/hooks/use-speech';
 import { Slider } from '@/components/ui/slider';
 import { buildActionAck } from '@/lib/agentic/jarvis';
 import { JarvisDashboard } from '@/components/jarvis/jarvis-dashboard';
 import { JarvisSettings } from '@/components/jarvis/jarvis-settings';
 import { JarvisBoot } from '@/components/jarvis/jarvis-boot';
 import type { JarvisVisualState } from '@/components/jarvis/jarvis-reactor';
+import { perfSample, perfStart } from '@/lib/perf';
+import { usePolling } from '@/hooks/use-polling';
 
 interface ConversationItem {
   id: string;
@@ -173,6 +175,27 @@ const JARVIS_STATE_LABEL: Record<JarvisVisualState, string> = {
   error: 'SYSTEM FAULT — CHECK ALERTS',
 };
 
+/**
+ * HUD clock. Lives in its own component ON PURPOSE: the 1 s tick used to
+ * call setClock() in the Studio root, re-rendering the ENTIRE tree (all
+ * panels, transcript markdown, reactor props) every second. Now only this
+ * span re-renders.
+ */
+function StudioClock() {
+  const [clock, setClock] = useState('');
+  useEffect(() => {
+    const tick = () => setClock(new Date().toLocaleTimeString([], { hour12: false }));
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <span className="hidden sm:block font-mono text-xs text-zinc-400 tabular-nums" aria-hidden>
+      {clock || '--:--:--'}
+    </span>
+  );
+}
+
 export function Studio() {
   const {
     connections,
@@ -203,19 +226,12 @@ export function Studio() {
   const [railOpen, setRailOpen] = useState(true);
   const [jarvisSettingsOpen, setJarvisSettingsOpen] = useState(false);
   const [bootDone, setBootDone] = useState(true);
-  const [clock, setClock] = useState('');
   useEffect(() => {
     try {
       setBootDone(window.sessionStorage.getItem('jarvis-booted') === '1');
     } catch {
       /* private mode */
     }
-  }, []);
-  useEffect(() => {
-    const tick = () => setClock(new Date().toLocaleTimeString([], { hour12: false }));
-    tick();
-    const t = setInterval(tick, 1000);
-    return () => clearInterval(t);
   }, []);
   // ---- voice (Roadmap #6): mic input + spoken replies — browser-native ----
   // BUGFIX (settings must stick): mic language now persists like hands-free /
@@ -359,40 +375,38 @@ export function Studio() {
     } catch {
       /* ignore */
     }
-    const check = async () => {
-      try {
-        const res = await fetch('/api/notifications?limit=10');
-        if (!res.ok) return;
-        const items = (await res.json()) as Array<{
-          id: string; read: boolean; body: string; data: Record<string, unknown>;
-        }>;
-        for (const n of items) {
-          const isMorning =
-            (n.data as { kind?: string })?.kind === 'morning_summary' &&
-            !n.read &&
-            !spokenSummariesRef.current.has(n.id);
-          if (isMorning) {
-            spokenSummariesRef.current.add(n.id);
-            try {
-              window.localStorage.setItem(
-                'agentscope-spoken-summaries',
-                JSON.stringify([...spokenSummariesRef.current].slice(-20))
-              );
-            } catch {
-              /* ignore */
-            }
-            ttsRef.current.speak(n.body || 'Good morning');
-          }
-        }
-      } catch {
-        /* never break the app for a spoken greeting */
-      }
-    };
-    const timer = setInterval(check, 60_000);
-    check();
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const checkMorningSummary = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch('/api/notifications?limit=10', { signal });
+      if (!res.ok) return;
+      const items = (await res.json()) as Array<{
+        id: string; read: boolean; body: string; data: Record<string, unknown>;
+      }>;
+      for (const n of items) {
+        const isMorning =
+          (n.data as { kind?: string })?.kind === 'morning_summary' &&
+          !n.read &&
+          !spokenSummariesRef.current.has(n.id);
+        if (isMorning) {
+          spokenSummariesRef.current.add(n.id);
+          try {
+            window.localStorage.setItem(
+              'agentscope-spoken-summaries',
+              JSON.stringify([...spokenSummariesRef.current].slice(-20))
+            );
+          } catch {
+            /* ignore */
+          }
+          ttsRef.current.speak(n.body || 'Good morning');
+        }
+      }
+    } catch {
+      /* never break the app for a spoken greeting */
+    }
+  }, []);
+  // Same 60 s cadence — skipped while the tab is hidden, never overlapping.
+  usePolling(checkMorningSummary, 60_000);
   // ---- agentic mode state (chat mode untouched) ----
   // JARVIS command center is the landing mode; every classic panel stays
   // reachable from the rail.
@@ -456,15 +470,14 @@ export function Studio() {
     if (res.ok) setAgents(await res.json());
   }, []);
 
-  const loadAgenticTasks = useCallback(async () => {
-    const res = await fetch('/api/agentic/tasks');
+  const loadAgenticTasks = useCallback(async (signal?: AbortSignal) => {
+    const res = await fetch('/api/agentic/tasks', { signal });
     if (res.ok) setAgenticTasks(await res.json());
   }, []);
 
   useEffect(() => {
     loadConversations();
     loadAgents();
-    loadAgenticTasks();
     // the API token (if the server requires one) is attached to every
     // same-origin /api request by this single wrapper
     installTokenFetch();
@@ -473,14 +486,16 @@ export function Studio() {
       .then((r) => r.json())
       .then(setPythonStatus)
       .catch(() => setPythonStatus(null));
-    // keep the task list (reactor state + sidebar) fresh so finished tasks
-    // flip the status pill back to STANDBY without a manual refresh
-    const t = setInterval(loadAgenticTasks, 15_000);
-    return () => clearInterval(t);
-  }, [loadConversations, loadAgents, loadAgenticTasks]);
+  }, [loadConversations, loadAgents]);
+  // keep the task list (reactor state + sidebar) fresh so finished tasks
+  // flip the status pill back to STANDBY without a manual refresh — skipped
+  // while hidden, refreshed once on return
+  usePolling(loadAgenticTasks, 15_000);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // During streaming a chunk lands every ~50 ms — re-triggering an
+    // animated scroll each time judders; 'auto' follows without animating.
+    bottomRef.current?.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth' });
   }, [messages, streaming]);
 
   // ---- conversation actions ----
@@ -690,11 +705,13 @@ export function Studio() {
     // Jarvis router: decide chat vs job BEFORE anything is sent to the model.
     let chatContent = content;
     try {
+      const intentTimer = perfStart('chat.intent');
       const ir = await fetch('/api/jarvis', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op: 'intent', content }),
       });
+      intentTimer.stop();
       if (ir.ok) {
         const decision = (await ir.json()) as {
           intent: 'chat' | 'action';
@@ -731,8 +748,12 @@ export function Studio() {
     setInput('');
     setStreaming(true);
     abortRef.current = new AbortController();
+    // Incremental voice: sentences speak AS they stream (null when TTS off).
+    let voiceSession: SentenceChain | null = null;
 
     try {
+      const chatTimer = perfStart('chat.total');
+      voiceSession = tts.startStreamSpeak();
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -750,6 +771,17 @@ export function Studio() {
       });
 
       if (!res.ok) {
+        // A provider 429 keeps its own retry hint (server maps it through).
+        if (res.status === 429) {
+          const data = (await res.json().catch(() => ({}))) as {
+            retryAfterSec?: number;
+          };
+          const wait =
+            typeof data.retryAfterSec === 'number' && data.retryAfterSec > 0
+              ? ` ${Math.ceil(data.retryAfterSec)}s me dobara try karo.`
+              : '';
+          throw new Error(`Rate limit lag gayi.${wait}`);
+        }
         const err = await res.json().catch(() => ({ error: 'Request failed' }));
         throw new Error(err.error || `HTTP ${res.status}`);
       }
@@ -757,23 +789,56 @@ export function Studio() {
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let full = '';
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        full += chunk;
+      let pending = '';
+      let lastFlush = 0;
+      let ttftRecorded = false;
+      const flush = () => {
+        if (!pending) return;
+        const text = pending;
+        pending = '';
+        lastFlush = Date.now();
         setMessages((prev) => {
           const next = [...prev];
           const last = next[next.length - 1];
           if (last && last.role === 'assistant') {
-            next[next.length - 1] = { ...last, content: last.content + chunk };
+            next[next.length - 1] = { ...last, content: last.content + text };
           }
           return next;
         });
+      };
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        if (!chunk) continue;
+        if (!ttftRecorded) {
+          ttftRecorded = true;
+          perfSample('chat.ttft', chatTimer.elapsed());
+          // first paint must be instant — the user is staring at the screen
+          lastFlush = 0;
+        }
+        full += chunk;
+        pending += chunk;
+        voiceSession?.feed(chunk);
+        // Batch UI updates: a fast provider emits a chunk every few ms, and
+        // every setState re-parses the whole reply as markdown. Capping
+        // paints at ~20/sec is visually identical and stops i3 jank.
+        if (Date.now() - lastFlush >= 50) flush();
       }
-      // voice mode (Roadmap #6): jab TTS on hai, poora jawab bol do
-      tts.speak(full);
+      flush(); // trailing partial batch
+      chatTimer.stop();
+      // voice mode: incremental session speaks during the stream; when TTS
+      // was off at stream start, speak the whole reply if it got enabled
+      // mid-stream (preserves the old end-of-stream behavior)
+      if (voiceSession) voiceSession.done();
+      else tts.speak(full);
     } catch (err) {
+      // A failed/aborted reply must not keep talking (partial speech stops).
+      try {
+        voiceSession?.abort();
+      } catch {
+        /* ignore */
+      }
       const msg =
         err instanceof Error && err.name !== 'AbortError'
           ? err.message
@@ -1075,9 +1140,7 @@ export function Studio() {
             </span>
           </div>
 
-          <span className="hidden sm:block font-mono text-xs text-zinc-400 tabular-nums" aria-hidden>
-            {clock || '--:--:--'}
-          </span>
+          <StudioClock />
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
