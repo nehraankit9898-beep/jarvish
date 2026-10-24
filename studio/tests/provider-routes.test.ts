@@ -81,8 +81,9 @@ type Handler = (
   ctx: { params: Promise<{ id: string }> }
 ) => Promise<Response>;
 
-async function modelsRoute(): Promise<{ POST: Handler }> {
+async function modelsRoute(): Promise<{ GET: Handler; POST: Handler }> {
   return (await import('@/app/api/providers/[id]/models/route')) as unknown as {
+    GET: Handler;
     POST: Handler;
   };
 }
@@ -99,6 +100,9 @@ const post = (body: unknown) =>
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+
+const get = (query = '') =>
+  new Request(`http://localhost/api/providers/gemini/models${query}`);
 
 beforeEach(() => {
   calls.listProviderModels.length = 0;
@@ -119,6 +123,21 @@ beforeEach(() => {
     message: 'Connected — verified with a real request',
     model: 'gemini-3.8-flash',
   };
+});
+
+describe('GET /api/providers/[id]/models', () => {
+  test('rejects API keys in query strings without echoing the key', async () => {
+    const { GET } = await modelsRoute();
+    const secret = 'sk-url-secret-123';
+    const res = await GET(get(`?apiKey=${secret}`), {
+      params: Promise.resolve({ id: 'gemini' }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(400);
+    expect(text).toContain('use POST');
+    expect(text).not.toContain(secret);
+    expect(calls.listProviderModels).toHaveLength(0);
+  });
 });
 
 describe('POST /api/providers/[id]/models', () => {
@@ -165,6 +184,28 @@ describe('POST /api/providers/[id]/models', () => {
     expect(data.source).toBe('catalog');
     expect(data.error).toContain('429');
     expect(data.note).toBeTruthy();
+  });
+
+  test('malformed JSON is a 400 instead of silently falling back to the catalog', async () => {
+    const { POST } = await modelsRoute();
+    const malformed = new Request('http://localhost/api/providers/gemini/models', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{',
+    });
+    const res = await POST(malformed, { params: Promise.resolve({ id: 'gemini' }) });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Invalid JSON body.' });
+    expect(calls.listProviderModels).toHaveLength(0);
+  });
+
+  test('rejects non-string credentials and oversized fields', async () => {
+    const { POST } = await modelsRoute();
+    for (const body of [{ apiKey: 123 }, { model: 'x'.repeat(257) }]) {
+      const res = await POST(post(body), { params: Promise.resolve({ id: 'gemini' }) });
+      expect(res.status).toBe(400);
+    }
+    expect(calls.listProviderModels).toHaveLength(0);
   });
 
   test('an unknown provider is a 404, not a fabricated list', async () => {
