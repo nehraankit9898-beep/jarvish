@@ -200,6 +200,36 @@ Bridge sirf **127.0.0.1** pe bind hota hai, token (`db/.desktop-token`) ke bina 
 Poora troubleshooting table: [`studio/docs/WINDOWS_SETUP.md`](studio/docs/WINDOWS_SETUP.md) §7.
 
 
+## Stonic Remote — phone se JARVIS (this session)
+
+Audit ka point #6 (jo "confirm nahi hua" tha) ab bana hua hai aur chal raha hai.
+
+**Kaise chalta hai**
+1. PC par sidebar → **Remote** → *Generate code* (6 digit, 3 minute, ek hi baar).
+2. Phone par wahi address + code: `http://<PC-IP>:3000/remote`
+   (bahar se: `cloudflared tunnel --url http://localhost:3000` → jo https URL mile, wahi phone me kholo)
+3. Phir mic dabao aur bolo — ya likho. Jawab wahi JARVIS deta hai jo PC par hai (same character,
+   same memory) aur phone use **bol kar sunata** hai. Hands-free on ho to har jawab ke baad dobara sunta hai.
+
+**Phone par kya chalta hai**
+- Mic input: Android Chrome ka `SpeechRecognition` (`hi-IN`), na ho to text input
+- Voice output: server TTS (`edge-tts` bridge) → na ho to phone ka `speechSynthesis`
+- Transcript + replies screen par, "End" se session band
+
+**Security (kyunki ye PC control kar sakta hai)**
+| Rule | Value |
+|---|---|
+| Pairing code | 6 digit, 3 min TTL, sirf ek baar chalta hai, 5 galat par cancel |
+| Brute force | per-client 10 attempts / minute |
+| Session token | 256-bit, `timingSafeEqual`, sirf phone ke `sessionStorage` me |
+| Idle expiry | 2 ghante |
+| Max devices | 3 (purana apne aap hat jata hai) |
+| Kill switch | pairing + messages dono refuse |
+| Audit | pair / connect / message / revoke sab audit trail me (token kabhi nahi) |
+
+PC se har device turant *Disconnect* ho sakta hai; phone ka `End` bhi session turant todta hai.
+Remote transcript PC ke Chat list me `Remote · <device>` conversation bankar dikhta hai.
+
 ## Character, World Monitor & PC skills (this session)
 
 Audit ke gaps par kaam — jo pehle missing/partial tha:

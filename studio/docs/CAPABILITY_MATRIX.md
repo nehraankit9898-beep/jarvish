@@ -79,7 +79,8 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Paani / break / stretch reminders | ❌ (schedule bana ke ho sakta hai, built-in rule nahi) |
 | Google Drive / OneDrive | ❌ (connector sirf Calendar + Gmail) |
 | Telegram | 🟡 bot connector hai (Web control nahi) · WhatsApp ❌ |
-| Music / playlist | 🟡 `desktop-open-app` se URL/file khulta hai; playlist ❌ |
+| Music / playlist | ✅ `music-play` + `music-control` (playlist ❌) |
+| **Stonic Remote** (phone se JARVIS) | ✅ **Remote** tab: 6-digit pairing code → phone `/remote` page → mic/text se baat, jawab awaaz me; session token (256-bit), 3 min code TTL, 2 h idle expiry, PC se instant disconnect, kill switch par band |
 
 ## Safety (naye features par bhi)
 - Har naya mutating endpoint `destructive` classify hota hai → **har baar approval**, trusted mode me bhi.

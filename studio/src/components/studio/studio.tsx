@@ -43,6 +43,7 @@ import {
   Volume2,
   VolumeX,
   Radar,
+  Smartphone,
 } from 'lucide-react';
 import { AgenticPanel } from './agentic-panel';
 import { ComparePanel } from './compare-panel';
@@ -60,6 +61,7 @@ import { GoalsPanel } from './goals-panel';
 import { BrowserPanel } from './browser-panel';
 import { PersonaPanel } from './persona-panel';
 import { WorldPanel } from './world-panel';
+import { RemotePanel } from './remote-panel';
 import { NotificationsBell } from './notifications-bell';
 import { PROVIDERS, getProvider, resolveModel } from '@/lib/providers';
 import { useConnections } from '@/lib/api-keys-store';
@@ -132,6 +134,7 @@ type StudioMode =
   | 'system'
   | 'persona'
   | 'world'
+  | 'remote'
   | 'dashboard';
 
 /** Sidebar navigation. `active` is the Tailwind class of the selected state. */
@@ -144,6 +147,7 @@ const NAV_ITEMS: {
   { mode: 'jarvis', label: 'JARVIS', icon: Bot, active: 'bg-cyan-600 hover:bg-cyan-500' },
   { mode: 'persona', label: 'Character', icon: Sparkles, active: 'bg-fuchsia-600 hover:bg-fuchsia-500' },
   { mode: 'world', label: 'World', icon: Globe, active: 'bg-cyan-600 hover:bg-cyan-500' },
+  { mode: 'remote', label: 'Remote', icon: Smartphone, active: 'bg-emerald-600 hover:bg-emerald-500' },
   { mode: 'dashboard', label: 'Home', icon: LayoutDashboard, active: 'bg-emerald-600 hover:bg-emerald-500' },
   { mode: 'chat', label: 'Chat', icon: MessageSquarePlus, active: 'bg-emerald-600 hover:bg-emerald-500' },
   { mode: 'agentic', label: 'Agentic', icon: BrainCircuit, active: 'bg-emerald-600 hover:bg-emerald-500' },
@@ -1306,6 +1310,8 @@ export function Studio() {
             <PersonaPanel />
           ) : mode === 'world' ? (
             <WorldPanel />
+          ) : mode === 'remote' ? (
+            <RemotePanel />
           ) : mode === 'dashboard' ? (
             <DashboardPanel />
           ) : messages.length === 0 ? (
