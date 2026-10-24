@@ -4,6 +4,7 @@ import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { recordAudit, clientIp } from '@/lib/agentic/audit';
 import { isActiveStatus, normalizeTaskStatus } from '@/lib/agentic/types';
 import { cancelHostApprovalsForTask } from '@/lib/agentic/host-control';
+import { cancelTaskExecution } from '@/lib/agentic/execution-cancellation';
 
 export const runtime = 'nodejs';
 
@@ -37,6 +38,8 @@ export async function POST(
       where: { id },
       data: { status: 'cancelled', pendingCommand: null },
     });
+    // Abort real in-flight processes/HTTP calls as well as changing the row.
+    const cancelledOperations = cancelTaskExecution(id);
     // drop any host approvals this task still had pending — otherwise the
     // screen loop stays blocked (up to its 10-min approval window) and a
     // late approve click would execute an action for a cancelled task
@@ -46,7 +49,7 @@ export async function POST(
       taskId: id,
       action: 'task.cancel',
       category: 'task',
-      details: { from: status, droppedApprovals },
+      details: { from: status, droppedApprovals, cancelledOperations },
       ip: clientIp(req.headers),
     });
     return Response.json({ ok: true, status: 'cancelled' });

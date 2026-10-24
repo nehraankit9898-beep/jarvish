@@ -11,7 +11,7 @@
 // the failure is reported on stderr so it is not silently swallowed).
 
 import { db } from '@/lib/db';
-import { protect } from './secrets';
+import { redactUnknown } from './secrets';
 
 export type AuditCategory =
   | 'security'
@@ -56,40 +56,13 @@ export interface AuditRecord {
   ip: string;
 }
 
-/** Keys whose values must never be written to the audit trail. */
-const REDACTED_KEYS = new Set([
-  'apikey',
-  'api_key',
-  'key',
-  'token',
-  'secret',
-  'password',
-  'passwd',
-  'authorization',
-  'bearer',
-]);
-
 function redactDetails(details: Record<string, unknown> | undefined): string {
   if (!details) return '{}';
-  const safe: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(details)) {
-    if (REDACTED_KEYS.has(k.toLowerCase())) {
-      safe[k] = '[REDACTED]';
-      continue;
-    }
-    if (typeof v === 'string') {
-      safe[k] = protect(v).masked.slice(0, 2000);
-    } else if (v === null || typeof v !== 'object') {
-      safe[k] = v;
-    } else {
-      try {
-        safe[k] = JSON.parse(protect(JSON.stringify(v)).masked);
-      } catch {
-        safe[k] = '[unserialisable]';
-      }
-    }
-  }
   try {
+    const safe = redactUnknown(details) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(safe)) {
+      if (typeof value === 'string') safe[key] = value.slice(0, 2000);
+    }
     return JSON.stringify(safe);
   } catch {
     return '{}';
@@ -116,7 +89,7 @@ export async function recordAudit(input: AuditInput): Promise<void> {
         // artifact is exactly where a caller dumps "the thing I touched" (a
         // tool payload, a provider row, a request body). Mask it the same way.
         artifact: input.artifact
-          ? protect(JSON.stringify(input.artifact)).masked.slice(0, 4000)
+          ? JSON.stringify(redactUnknown(input.artifact)).slice(0, 4000)
           : '',
         details: redactDetails(input.details),
         ip: (input.ip ?? '').slice(0, 64),

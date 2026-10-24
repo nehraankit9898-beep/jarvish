@@ -7,6 +7,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { resolveModel } from './providers';
+import { assertOutboundUrl } from './agentic/outbound';
 
 export interface CoreChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -328,7 +329,7 @@ export async function buildUpstreamStream(
   const apiKey = config.apiKey?.trim() || '';
   // Retired models (e.g. gemini-2.0-flash → gemini-3.8-flash) auto-map karo
   const model = resolveModel(provider, config.model);
-  const baseUrl = (config.baseUrl?.trim() || provider.baseUrl).replace(
+  let baseUrl = (config.baseUrl?.trim() || provider.baseUrl).replace(
     /\/+$/,
     ''
   );
@@ -354,6 +355,15 @@ export async function buildUpstreamStream(
       throw new Error('Z.ai base URL is required when no .z-ai-config file is present.');
     }
   }
+
+  // Runtime calls use the same outbound boundary as connection tests. This
+  // prevents a configured/custom endpoint from reaching metadata or private
+  // services. Loopback remains available for local model servers unless the
+  // operator explicitly disables it.
+  baseUrl = (await assertOutboundUrl(baseUrl, {
+    allowLoopback: process.env.AGENTSCOPE_PROVIDER_ALLOW_LOOPBACK !== '0',
+    allowPrivateNetwork: false,
+  })).toString().replace(/\/+$/, '');
 
   // One upstream call = one timeout + the caller's abort (user Stop) + our
   // own release switch (stream cancel). Whichever fires first wins; a
@@ -443,10 +453,10 @@ export async function buildUpstreamStream(
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: geminiParts(m),
     }));
-  const url = `${baseUrl}/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  const url = `${baseUrl}/models/${model}:streamGenerateContent?alt=sse`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
       contents,
       ...(systemMsg

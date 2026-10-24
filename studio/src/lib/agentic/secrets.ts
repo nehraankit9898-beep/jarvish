@@ -16,7 +16,7 @@ const SECRET_PATTERNS: { name: string; re: RegExp }[] = [
   },
   {
     name: 'Generic password assignment',
-    re: /(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['"][^'"]{8,}['"]/gi,
+    re: /["']?(password|passwd|secret|api[_-]?key|token)["']?\s*[:=]\s*(?:'[^']{8,}'|"[^"]{8,}"|[^\s,;}{]{8,})/gi,
   },
 ];
 
@@ -52,4 +52,38 @@ export function protect(text: string): { masked: string; found: { name: string; 
   const env = maskEnvValues(text);
   const result = scanAndMask(env);
   return { masked: result.masked, found: result.found };
+}
+
+const SENSITIVE_KEY = /^(?:key|api[_-]?key|apikey|token|secret|password|passwd|authorization|bearer|cookie|set-cookie|credential|credentials)$/i;
+const SENSITIVE_SUFFIX = /(?:ApiKey|Token|Secret|Password|Passphrase|Credential|Authorization)$/;
+
+/**
+ * Deeply redact JSON-shaped values without losing their structure. String
+ * masking alone misses nested `{ credentials: { apiKey: "..." } }` objects;
+ * sensitive keys are removed by name at every depth and all other strings go
+ * through the normal pattern/env masker.
+ */
+export function redactUnknown(value: unknown): unknown {
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown, depth: number): unknown => {
+    if (typeof current === 'string') return protect(current).masked;
+    if (current === null || current === undefined) return current;
+    if (typeof current !== 'object') return current;
+    if (depth > 12) return '[truncated]';
+    if (seen.has(current as object)) return '[circular]';
+    seen.add(current as object);
+    try {
+      if (Array.isArray(current)) return current.map((item) => visit(item, depth + 1));
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(current as Record<string, unknown>)) {
+        out[key] = SENSITIVE_KEY.test(key) || SENSITIVE_SUFFIX.test(key)
+          ? '[REDACTED]'
+          : visit(item, depth + 1);
+      }
+      return out;
+    } finally {
+      seen.delete(current as object);
+    }
+  };
+  return visit(value, 0);
 }

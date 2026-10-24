@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { db } from '@/lib/db';
 import { listEvents } from '@/lib/agentic/event-store';
 import { isTerminalStatus, normalizeTaskStatus } from '@/lib/agentic/types';
+import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -24,6 +25,9 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const unauthorized = rejectIfUnauthorized(req);
+  if (unauthorized) return unauthorized;
+
   const { id } = await params;
 
   const task = await db.agenticTask.findUnique({

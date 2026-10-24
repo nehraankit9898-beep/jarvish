@@ -41,6 +41,7 @@ import { PROVIDERS, getProvider, resolveModel } from '@/lib/providers';
 import type { AgenticEvent, PlanStep } from '@/lib/agentic/types';
 import { AGENT_ROLES, AGENT_ROLE_LABEL, type AgentRole } from '@/lib/agentic/agent-config';
 import type { ConnectionsMap } from '@/lib/api-keys-store';
+import { openEventStream, type EventStreamClient } from '@/lib/sse-client';
 import { DiffViewDialog, FileViewDialog } from './diff-view';
 
 // ---------- API shapes ----------
@@ -116,11 +117,6 @@ const STEP_KIND_META: Record<string, { emoji: string; label: string }> = {
   review: { emoji: '🔍', label: 'Review' },
 };
 
-// EventSource cannot set custom headers, so the API token (when configured)
-// is passed via the query string. NEXT_PUBLIC_AGENTSCOPE_API_TOKEN must be set
-// in .env for the live stream to work when AGENTSCOPE_API_TOKEN is enabled.
-const STREAM_TOKEN = process.env.NEXT_PUBLIC_AGENTSCOPE_API_TOKEN || '';
-
 const EXAMPLES = [
   'Workspace me ek Python CLI calculator banao (add, sub, mul, div) aur uske tests bhi',
   'Ek Node.js script likho jo CSV file parse kare aur summary print kare, phir sample CSV se test karo',
@@ -139,7 +135,7 @@ const ROLE_EMOJI: Record<string, string> = {
   orchestrator: '🎛️',
 };
 
-type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'completed';
+type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'completed' | 'error';
 
 interface RoleAssignment {
   provider: string;
@@ -268,15 +264,15 @@ export function AgenticPanel({
       return;
     }
     let cancelled = false;
-    let source: EventSource | null = null;
+    let source: EventStreamClient | null = null;
     let retry = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
       if (cancelled) return;
       setStreamState(retry === 0 ? 'connecting' : 'reconnecting');
-      const url = `/api/agentic/tasks/${task.id}/stream?after=${lastSeqRef.current}${STREAM_TOKEN ? `&token=${encodeURIComponent(STREAM_TOKEN)}` : ''}`;
-      const es = new EventSource(url);
+      const url = `/api/agentic/tasks/${task.id}/stream?after=${lastSeqRef.current}`;
+      const es = openEventStream(url);
       source = es;
 
       es.onopen = () => {
@@ -315,9 +311,13 @@ export function AgenticPanel({
         }
       };
 
-      es.onerror = () => {
+      es.onerror = ({ status }) => {
         es.close();
         if (cancelled) return;
+        if (status === 401 || status === 403 || status === 503) {
+          setStreamState('error');
+          return;
+        }
         setStreamState('reconnecting');
         retry += 1;
         timer = setTimeout(connect, Math.min(8000, 700 * retry));

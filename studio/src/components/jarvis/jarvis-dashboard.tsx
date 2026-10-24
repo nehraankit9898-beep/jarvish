@@ -43,10 +43,10 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/hooks/use-toast';
 import { usePolling } from '@/hooks/use-polling';
+import { openEventStream, type EventStreamClient } from '@/lib/sse-client';
 import type { ChatMessageData } from '../studio/chat-message';
 import type { useVoiceInput, useSpeechOutput, useWakeWord, VoiceLang } from '@/hooks/use-speech';
 
-const STREAM_TOKEN = (process.env.NEXT_PUBLIC_AGENTSCOPE_API_TOKEN as string | undefined) ?? '';
 
 type Voice = ReturnType<typeof useVoiceInput>;
 type Tts = ReturnType<typeof useSpeechOutput>;
@@ -342,7 +342,7 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
   const [taskDetail, setTaskDetail] = useState<TaskDetail | null>(null);
   const [taskEvents, setTaskEvents] = useState<AgenticEvent[]>([]);
   const [streamState, setStreamState] = useState<
-    'idle' | 'live' | 'connecting' | 'reconnecting' | 'completed'
+    'idle' | 'live' | 'connecting' | 'reconnecting' | 'completed' | 'error'
   >('idle');
   const lastSeqRef = useRef(0);
   const [taskBusy, setTaskBusy] = useState(false);
@@ -379,15 +379,15 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
     const id = activeTaskItem?.id;
     if (!id) return;
     let cancelled = false;
-    let source: EventSource | null = null;
+    let source: EventStreamClient | null = null;
     let retry = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
       if (cancelled) return;
       setStreamState(retry === 0 ? 'connecting' : 'reconnecting');
-      const url = `/api/agentic/tasks/${id}/stream?after=${lastSeqRef.current}${STREAM_TOKEN ? `&token=${encodeURIComponent(STREAM_TOKEN)}` : ''}`;
-      const es = new EventSource(url);
+      const url = `/api/agentic/tasks/${id}/stream?after=${lastSeqRef.current}`;
+      const es = openEventStream(url);
       source = es;
       es.onopen = () => {
         if (!cancelled) {
@@ -417,9 +417,13 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
           es.close();
         }
       };
-      es.onerror = () => {
+      es.onerror = ({ status }) => {
         es.close();
         if (cancelled) return;
+        if (status === 401 || status === 403 || status === 503) {
+          setStreamState('error');
+          return;
+        }
         setStreamState('reconnecting');
         retry += 1;
         timer = setTimeout(connect, Math.min(8000, 700 * retry));

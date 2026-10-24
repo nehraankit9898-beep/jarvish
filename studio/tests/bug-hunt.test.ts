@@ -93,6 +93,7 @@ describe('H5 — plan dependencies must reference steps that exist', () => {
 // ---------------------------------------------------------------------------
 describe('H6 — duplicate-run guard keeps its claim while a run is starting', () => {
   let scheduleId = '';
+  const originalRunCreate = db.automationRun.create;
 
   beforeEach(async () => {
     await db.automationSchedule.deleteMany();
@@ -106,7 +107,9 @@ describe('H6 — duplicate-run guard keeps its claim while a run is starting', (
   });
 
   afterEach(() => {
-    delete (db.automationRun as unknown as { create?: unknown }).create;
+    // Restore the real delegate. Deleting it leaked into later test files and
+    // caused order-dependent "automationRun.create is not a function" failures.
+    (db.automationRun as unknown as { create: unknown }).create = originalRunCreate;
   });
 
   test('a second starter cannot release the first one claim', async () => {

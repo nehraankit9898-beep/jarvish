@@ -2,8 +2,12 @@
 // Every command passes checkCommand(); destructive ones require prior
 // explicit approval (approvedCommands set filled from the UI decision).
 
-import { spawn } from 'child_process';
-import { taskWorkspace } from './workspace';
+import { spawn, type ChildProcess } from 'child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { taskWorkspace, WORKSPACE_ROOT } from './workspace';
+import { onTaskExecutionCancelled } from './execution-cancellation';
+import { assertNotKilled } from './safety';
 import { checkCommand, type Permission } from './permissions';
 import { protect } from './secrets';
 import type { CommandRecord } from './types';
@@ -57,6 +61,102 @@ function sanitizedEnv(cwd: string): NodeJS.ProcessEnv {
   } as NodeJS.ProcessEnv;
 }
 
+/** Extract shell-ish words for path checks (quotes removed, syntax retained). */
+function commandWords(command: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let quote = '';
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+      else word += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch) || /[;|&<>]/.test(ch)) {
+      if (word) words.push(word);
+      word = '';
+      continue;
+    }
+    word += ch;
+  }
+  if (word) words.push(word);
+  return words;
+}
+
+function insideDirectory(candidate: string, directory: string): boolean {
+  const rel = path.relative(directory, candidate);
+  return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
+}
+
+function nearestRealPath(target: string): string {
+  let current = target;
+  for (;;) {
+    try {
+      return fs.realpathSync.native(current);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return current;
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Terminal commands are workspace-scoped, not general host shell access.
+ * Reject parent/absolute escapes before classification (approval must not turn
+ * this tool into the separate host-exec capability), and resolve every
+ * existing path-like argument so a planted symlink cannot redirect a safe
+ * read/write outside the workspace.
+ */
+export function assertWorkspaceCommand(taskId: string, command: string): void {
+  const deny = (reason: string): never => {
+    throw new CommandDeniedError(command, `Workspace boundary: ${reason}`, 'forbidden');
+  };
+  // `..` as a path segment in either slash style. Approval is not an escape
+  // hatch; users can use the explicitly separate host-exec tool instead.
+  if (/(?:^|[\s/\\"'`=(:;,|&<>])\.\.(?=$|[\s/\\"'`=(:;,|&<>)])/i.test(command)) {
+    deny('parent-directory traversal is not allowed');
+  }
+  // Absolute POSIX / Windows paths and another user's ~ home. URLs are not
+  // path arguments and are deliberately excluded by the negative lookahead.
+  if (/(?:^|[\s"'`=(:;,|&<>])\/(?!\/)/.test(command) || /(?:^|[\s"'`=(:;,|&<>])[A-Za-z]:[\\/]/.test(command) || /(?:^|[\s"'`=(:;,|&<>])~[A-Za-z0-9_-]/.test(command)) {
+    deny('absolute/out-of-workspace paths are not allowed');
+  }
+  if (/\.parent\b/i.test(command)) {
+    deny('walking to a parent directory is not allowed');
+  }
+
+  const cwd = taskWorkspace(taskId);
+  let cwdReal: string | undefined;
+  let rootReal: string | undefined;
+  try {
+    cwdReal = fs.realpathSync.native(cwd);
+    rootReal = fs.realpathSync.native(WORKSPACE_ROOT);
+  } catch {
+    deny('workspace is not ready');
+  }
+  if (!cwdReal || !rootReal) {
+    throw new CommandDeniedError(command, 'Workspace boundary: workspace is not ready', 'forbidden');
+  }
+  if (!insideDirectory(cwdReal, rootReal)) deny('workspace root resolves outside its sandbox');
+
+  for (const raw of commandWords(command)) {
+    const word = raw.includes('=') && raw.startsWith('-') ? raw.slice(raw.indexOf('=') + 1) : raw;
+    if (!word || word.startsWith('$') || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(word)) continue;
+    // Only existing paths (or paths below an existing ancestor) can be
+    // resolved. Nonexistent ordinary words simply remain inside cwd.
+    const candidate = path.resolve(cwdReal, word);
+    if (!insideDirectory(candidate, cwdReal)) deny(`path escapes the workspace: ${word.slice(0, 120)}`);
+    const real = nearestRealPath(candidate);
+    if (!insideDirectory(real, cwdReal)) deny(`symlink escapes the workspace: ${word.slice(0, 120)}`);
+  }
+}
+
 /**
  * Execute a command with cwd = workspace.
  * @param approvedCommands commands the user explicitly approved via UI
@@ -70,6 +170,7 @@ export async function executeCommand(
     autoApproveDestructive?: boolean; // ONLY used by explicit user action endpoints
   } = {}
 ): Promise<ExecResult> {
+  assertNotKilled();
   // Execute the command EXACTLY as given (trimmed) — collapsing whitespace
   // would corrupt quoted arguments like echo "a   b".
   const command = String(rawCommand ?? '').trim();
@@ -80,6 +181,7 @@ export async function executeCommand(
   // record it feeds) reported the whole payload as the first, harmless line.
   // The normalized form is still the right key for APPROVAL MATCHING, where
   // whitespace differences between the LLM and the UI must not matter.
+  assertWorkspaceCommand(taskId, command);
   const check = checkCommand(command);
   const approved = new Set((opts.approvedCommands ?? []).map(normalizeCommand));
   const approvedRaw = new Set((opts.approvedCommands ?? []).map((c) => String(c ?? '').trim()));
@@ -113,6 +215,7 @@ export async function executeCommand(
   const [shell, shellFlag] = shellCmd(command);
 
   const result = await spawnCapture(
+    taskId,
     shell,
     [shellFlag, command],
     cwd,
@@ -142,6 +245,7 @@ export async function executeArgv(
     autoApproveDestructive?: boolean;
   } = {}
 ): Promise<ExecResult> {
+  assertNotKilled();
   const logical = normalizeCommand(opts.logical ?? [bin, ...args].join(' '));
   const check = checkCommand(logical);
   const approved = new Set((opts.approvedCommands ?? []).map(normalizeCommand));
@@ -162,6 +266,7 @@ export async function executeArgv(
   const started = Date.now();
   const cwd = taskWorkspace(taskId);
   const result = await spawnCapture(
+    taskId,
     bin,
     args,
     cwd,
@@ -170,7 +275,40 @@ export async function executeArgv(
   return buildExecResult(logical, check, result, started);
 }
 
+function terminateProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    return;
+  }
+  if (process.platform === 'win32') {
+    // taskkill /T includes descendants. It is an argv invocation, never a
+    // shell built from a command or path. Windows verification remains a
+    // packaging/host test; the POSIX path is exercised by the Linux suite.
+    try {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+        shell: false,
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => { try { child.kill('SIGKILL'); } catch { /* gone */ } });
+      killer.unref();
+    } catch {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }
+    return;
+  }
+  try {
+    // The child is a process-group leader (detached on POSIX), so this kills
+    // the shell AND descendants such as `sleep ... &` / test runners.
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
 function spawnCapture(
+  taskId: string,
   bin: string,
   args: string[],
   cwd: string,
@@ -178,17 +316,18 @@ function spawnCapture(
 ): Promise<{ exitCode: number | null; output: string }> {
   return new Promise((resolve) => {
     let done = false;
+    let unregister: () => void = () => undefined;
     const finish = (r: { exitCode: number | null; output: string }) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      unregister();
       resolve(r);
     };
     const child = spawn(bin, args, {
       cwd,
       env: sanitizedEnv(cwd),
-      timeout: timeoutMs,
-      detached: false,
+      detached: process.platform !== 'win32',
       shell: false,
     });
 
@@ -200,9 +339,14 @@ function spawnCapture(
     if (child.stderr) child.stderr.on('data', collect);
 
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      terminateProcessTree(child);
       finish({ exitCode: -1, output: output + '\n[timeout]' });
     }, timeoutMs);
+
+    unregister = onTaskExecutionCancelled(taskId, () => {
+      terminateProcessTree(child);
+      finish({ exitCode: -1, output: output + '\n[cancelled]' });
+    });
 
     child.on('error', (err) => {
       finish({ exitCode: -1, output: `\n[spawn error] ${err.message}` });

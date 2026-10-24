@@ -47,6 +47,7 @@ interface LiveSession {
   context: {
     newPage: () => Promise<unknown>;
     close: () => Promise<void>;
+    route?: (pattern: string, handler: (route: BrowserRoute, request: BrowserRequest) => Promise<void>) => Promise<void>;
   };
   /** true when this session rides the user's REAL Chrome over CDP */
   cdp?: boolean;
@@ -58,9 +59,63 @@ interface LiveSession {
     click: (selector: string, opts?: unknown) => Promise<void>;
     fill: (selector: string, value: string, opts?: unknown) => Promise<void>;
     waitForTimeout: (ms: number) => Promise<void>;
+    close?: () => Promise<void>;
+    route?: (pattern: string, handler: (route: BrowserRoute, request: BrowserRequest) => Promise<void>) => Promise<void>;
     url: () => string;
     on?: (event: string, handler: (payload: unknown) => void) => void;
   };
+}
+
+interface BrowserRoute {
+  continue: () => Promise<void>;
+  abort: (errorCode?: string) => Promise<void>;
+}
+interface BrowserRequest { url: () => string }
+
+/** Validate every document, redirect and subresource before Chromium sends it. */
+export async function assertBrowserUrl(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(String(rawUrl ?? '').trim());
+  } catch {
+    throw new BrowserError(`Invalid URL: ${String(rawUrl ?? '').slice(0, 300)}`);
+  }
+  if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+    return assertOutboundUrl(parsed.toString(), {
+      allowLoopback: loopbackAllowed(),
+      requireHttps: false,
+    });
+  }
+  // These schemes do not create a new host network request. Everything else
+  // (notably file:, ftp:, chrome: and arbitrary external protocols) is denied.
+  if (parsed.protocol === 'data:' || parsed.protocol === 'blob:' || parsed.toString() === 'about:blank' || parsed.toString() === 'about:srcdoc') {
+    return parsed;
+  }
+  throw new BrowserError(`Browser URL scheme is not allowed: ${parsed.protocol}`);
+}
+
+async function attachRequestGuard(
+  page: LiveSession['page'],
+  context: LiveSession['context'],
+  contextWide: boolean
+): Promise<void> {
+  const handler = async (route: BrowserRoute, request: BrowserRequest) => {
+    try {
+      await assertBrowserUrl(request.url());
+      await route.continue();
+    } catch {
+      // Aborting is the enforcement result; a blocked main navigation then
+      // rejects page.goto instead of silently reporting a successful visit.
+      await route.abort('blockedbyclient').catch(() => undefined);
+    }
+  };
+  // Context routing covers popups in an isolated session. For real Chrome we
+  // must route ONLY our new tab, never intercept the user's other tabs.
+  const target = contextWide ? context : page;
+  if (typeof target.route !== 'function') {
+    throw new BrowserError('This Playwright build cannot enforce browser request boundaries');
+  }
+  await target.route('**/*', handler);
 }
 
 /** playwright types are loaded lazily so the studio works without browsers installed */
@@ -116,6 +171,12 @@ export async function createSession(
     locale: 'en-US',
   });
   const page = (await context.newPage()) as LiveSession['page'];
+  try {
+    await attachRequestGuard(page, context, true);
+  } catch (error) {
+    await context.close().catch(() => undefined);
+    throw error;
+  }
   attachDownloadHandler(page, taskId);
   const row = await db.browserSession.create({
     data: { taskId, status: 'idle' },
@@ -264,6 +325,13 @@ export async function connectRealChrome(opts: {
   const contexts = (browser.contexts?.() ?? []) as LiveSession['context'][];
   const context = contexts[0] ?? (await browser.newContext());
   const page = (await context.newPage()) as LiveSession['page'];
+  try {
+    await attachRequestGuard(page, context, false);
+  } catch (error) {
+    await page.close?.().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+    throw error;
+  }
   attachDownloadHandler(page, opts.taskId ?? '');
   const row = await db.browserSession.create({
     data: { taskId: opts.taskId ?? '', status: 'idle' },
@@ -351,30 +419,13 @@ export async function navigate(
   const live = await requireOpenSession(sessionId);
   if (opts.actor === 'agent') await assertAgentMayAct(sessionId);
   const target = String(url ?? '').trim();
-  let parsed: URL;
-  try {
-    parsed = new URL(target);
-  } catch {
-    throw new BrowserError(`Invalid URL: ${target}`);
-  }
-  if (!/^https?:$/.test(parsed.protocol)) {
-    throw new BrowserError('Only http(s) URLs are allowed');
-  }
-  // the browser obeys the SAME SSRF policy as the provider connections
-  // (loopback only with the explicit opt-in — see loopbackAllowed()).
-  // H16: `requireHttps` is dropped here on purpose. It exists so an LLM
-  // provider base URL cannot be dialed over cleartext; a WEB BROWSER is
-  // different — refusing http:// made the tool reject plain-http links it had
-  // just advertised as allowed ("Only http(s) URLs are allowed"), including
-  // local dev sites that are not on loopback. Every address rule still
-  // applies: private, link-local and metadata targets stay blocked.
-  await assertOutboundUrl(parsed.toString(), {
-    allowLoopback: loopbackAllowed(),
-    requireHttps: false,
-  });
+  const parsed = await assertBrowserUrl(target);
   await db.browserSession.update({ where: { id: sessionId }, data: { status: 'navigating' } });
   try {
     await live.page.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    // Redirects are intercepted too; this final assertion protects callers
+    // from any engine-specific routing gap and records only a safe final URL.
+    await assertBrowserUrl(live.page.url());
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Navigation failed';
     await db.browserSession.update({ where: { id: sessionId }, data: { status: 'idle' } });
@@ -622,7 +673,8 @@ export async function releaseControl(sessionId: string): Promise<{ ok: boolean; 
 export async function closeSession(sessionId: string): Promise<{ ok: boolean }> {
   const live = sessions.get(sessionId);
   if (live) {
-    await live.context.close().catch(() => undefined);
+    if (live.cdp) await live.page.close?.().catch(() => undefined);
+    else await live.context.close().catch(() => undefined);
     sessions.delete(sessionId);
   }
   // a CDP session only DETACHES from the real Chrome — the user's browser
