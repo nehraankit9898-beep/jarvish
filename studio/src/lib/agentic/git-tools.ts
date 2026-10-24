@@ -68,6 +68,10 @@ async function runGit(
 
 /** git init + initial baseline commit (idempotent). */
 export async function ensureRepo(taskId: string, taskLabel = 'baseline'): Promise<void> {
+  // the workspace is the cwd of every git call — it must exist BEFORE `git
+  // init` (a missing cwd makes posix_spawn fail with ENOENT, which used to
+  // surface as a confusing "git init failed")
+  await fs.mkdir(taskWorkspace(taskId), { recursive: true });
   await runGit(taskId, ['init', '-q'], { logical: 'git init -q', timeoutMs: 30_000 });
   await runGit(taskId, ['config', 'user.email', 'agentic@studio.local'], {
     logical: 'git config user.email "agentic@studio.local"',
@@ -100,6 +104,28 @@ export async function ensureRepo(taskId: string, taskLabel = 'baseline'): Promis
   );
 }
 
+/**
+ * Make sure the workspace is ITS OWN git repository.
+ *
+ * Without this a task whose workspace was never initialised runs `git add -A`
+ * in a SUBDIRECTORY of the host repository — git then walks up to the parent
+ * repo, so the engine would stage/ commit inside the user's own project (and
+ * two concurrent agents would fight over the parent's `index.lock`). That is
+ * exactly what an end-to-end test caught: `parallelism: 3` + a workspace
+ * without `.git` produced "git commit failed: index.lock" against the host.
+ *
+ * Cheap: one `stat` when the repo already exists.
+ */
+async function ensureOwnRepo(taskId: string): Promise<void> {
+  const ws = taskWorkspace(taskId);
+  try {
+    await fs.stat(path.join(ws, '.git'));
+    return;
+  } catch {
+    await ensureRepo(taskId);
+  }
+}
+
 /** Strip anything that could break a commit message; keep it human readable. */
 function sanitizeLabel(label: string): string {
   return String(label ?? '')
@@ -110,6 +136,7 @@ function sanitizeLabel(label: string): string {
 
 /** Commit current state; returns the snapshot hash. */
 export async function snapshot(taskId: string, label: string): Promise<Snapshot> {
+  await ensureOwnRepo(taskId);
   await runGit(taskId, ['add', '-A'], { logical: 'git add -A', timeoutMs: 30_000 });
   const clean = sanitizeLabel(label);
   await runGit(taskId, ['commit', '-q', '-m', clean, '--allow-empty', '--'], {
@@ -133,6 +160,7 @@ export async function diffBetween(
   from: string,
   to: string
 ): Promise<string> {
+  await ensureOwnRepo(taskId);
   const safeFrom = assertSafeGitRef(from);
   const safeTo = assertSafeGitRef(to);
   const res = await runGit(
@@ -154,6 +182,7 @@ export async function changedFiles(
   from: string,
   to: string
 ): Promise<string[]> {
+  await ensureOwnRepo(taskId);
   const safeFrom = assertSafeGitRef(from);
   const safeTo = assertSafeGitRef(to);
   const res = await runGit(
@@ -169,6 +198,7 @@ export async function changedFiles(
 
 /** Resolve the baseline (first) commit hash. */
 export async function baselineRef(taskId: string): Promise<string> {
+  await ensureOwnRepo(taskId);
   const res = await runGit(taskId, ['rev-list', '--max-parents=0', 'HEAD'], {
     logical: 'git rev-list --max-parents=0 HEAD',
     timeoutMs: 15_000,

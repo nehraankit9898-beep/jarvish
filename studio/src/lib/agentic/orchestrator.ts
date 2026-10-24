@@ -1110,6 +1110,8 @@ interface WaveRunResult {
   /** cancelled / paused / timed out — stop launching new waves */
   stopped: boolean;
   timedOut: boolean;
+  /** the executor itself threw — the task must FAIL, never be reported done */
+  crashed?: string;
 }
 
 /**
@@ -1559,6 +1561,10 @@ export async function runTask(
   // step is never started twice by the two executors.
   const parallel = resolveParallelOptions(mergedConfig);
   const claimed = new Set<number>();
+  // A step that is being CONTINUED after an approval belongs to this serial
+  // run (it resumes at commandIndex+1) — reserve it so no agent re-runs it
+  // from scratch.
+  if (resumeFrom.forIndex) claimStep(claimed, resumeFrom.forIndex);
   const parallelDone: Promise<WaveRunResult> = runParallelWaves({
     task,
     planSteps,
@@ -1571,14 +1577,27 @@ export async function runTask(
     lock,
     claimed,
     parallel,
-  }).catch(() => ({
-    ran: 0,
-    parked: null,
-    failed: null,
-    awaiting: false,
-    stopped: true,
-    timedOut: false,
-  }) as WaveRunResult);
+  }).catch((err) => {
+    // A crash inside a wave must be VISIBLE, never a silently "done" task with
+    // steps left in `running`.
+    emit({
+      type: 'error',
+      taskId,
+      at: new Date().toISOString(),
+      data: {
+        message: `Parallel executor crashed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    });
+    return {
+      ran: 0,
+      parked: null,
+      failed: null,
+      awaiting: false,
+      stopped: true,
+      timedOut: false,
+      crashed: err instanceof Error ? err.message : String(err),
+    } as WaveRunResult;
+  });
 
   emit({
     type: 'log',
@@ -1778,6 +1797,13 @@ export async function runTask(
     }
 
     // implement / analyze / test steps
+    //
+    // These belong to the WAVE EXECUTOR. The serial loop only continues a step
+    // that was interrupted by an approval gate (it has the persisted actions
+    // and restarts at the next command) — nothing else. Without this split both
+    // executors pulled from the same plan, so `parallelism: 1` was not serial
+    // and a writer could start while a conflicting writer was still running.
+    if (resumeFrom.forIndex !== planStep.index) continue;
     const readOnlyStep = isReadOnlyKind(planStep.kind);
     // reserve the step so the wave executor cannot start it at the same time
     if (!claimStep(claimed, planStep.index)) continue;
@@ -1850,6 +1876,16 @@ export async function runTask(
 
   // ---- the serial loop is over: wait for the parallel agents ----
   const parallelResult = await parallelDone;
+  if (parallelResult.crashed) {
+    // the executor died (missing tool, disk error...). Reporting the task as
+    // `done` would leave steps stuck in `running` — fail it loudly instead.
+    await finishTask(taskId, 'failed', emit, {
+      summary: `Parallel executor crashed: ${parallelResult.crashed}`,
+      remainingBugs: [parallelResult.crashed],
+    });
+    await emit.drain();
+    return;
+  }
   if (parallelResult.timedOut) {
     await finishTask(taskId, 'failed', emit, {
       summary: 'Task timeout exceeded while a parallel agent was running.',
@@ -2029,6 +2065,15 @@ async function executeStep(params: {
   /** critical sections of a WRITER hold the workspace lock; readers never do */
   const runLocked = <T>(fn: () => Promise<T>): Promise<T> =>
     readOnlyStep ? fn() : withWriteLock(lock, holder, fn);
+
+  /**
+   * A git snapshot is a WRITE too — even for a read-only agent, which writes
+   * nothing to the workspace but still creates a commit. Running it outside
+   * the lock let two agents fight over `.git/index.lock` (an end-to-end test
+   * caught exactly that), so snapshots are always serialized.
+   */
+  const runSnapshotLocked = <T>(fn: () => Promise<T>): Promise<T> =>
+    withWriteLock(lock, holder, fn);
 
   // the step is 'running' from the moment its agent wakes up — the live board
   // can then tell "working" from "queued", and an orphaned 'running' row is
@@ -2280,7 +2325,7 @@ async function executeStep(params: {
 
       // success
       progress('snapshot', 'Recording the workspace snapshot');
-      const snap = await runLocked(async () => {
+      const snap = await runSnapshotLocked(async () => {
         const committed = await snapshot(task.id, `step-${planStep.index}: ${planStep.title}`);
         await stepSetStatus(step.id, 'passed', { testResult: 'pass' });
         return committed;

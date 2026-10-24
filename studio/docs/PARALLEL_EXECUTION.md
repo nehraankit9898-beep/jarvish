@@ -123,16 +123,40 @@ read-only step dono se start ho sakta tha. Ab:
 
 ---
 
-## 5. Test
+## 5. Bugs jo end-to-end test ne pakde (aur fix hue)
+
+Ye test sirf "green tick" nahi tha — isne 4 asli bugs surface kiye:
+
+| Bug | Kya hota tha | Fix |
+|---|---|---|
+| **Do executors ek hi plan se** | serial loop + wave executor dono steps uthate the → `parallelism: 1` bhi parallel chalta tha, aur ek writer aise writer ke saath chal sakta tha jiska scope overlap karta ho | serial loop ab **sirf** approval ke baad resume hone wala step continue karta hai; wo step pehle hi claim ho jaata hai |
+| **Read-only step ka git snapshot lock ke bahar** | do agents ek saath `git commit` karte → `.git/index.lock` conflict, task fail | snapshot **hamesha** workspace lock ke andar (`runSnapshotLocked`) |
+| **Wave executor ka crash chup-chaap nigal liya jaata tha** | task `done` dikhta tha jabki steps `running` me atke rehte | crash ab `error` event + task `failed` (reason ke saath) |
+| **Workspace apna git repo na ho to parent repo me likhna** | `.git` missing hone par `git add/commit` upar wale (user ke) repo me chalta tha, uske index.lock se takraata tha | `ensureOwnRepo()` — snapshot/diff/baseline se pehle; `ensureRepo` pehle workspace dir banata hai |
+
+## 6. Test
 
 ```bash
-bun test tests/parallel.test.ts
+bun test tests/parallel.test.ts                    # 35 pure unit tests
+bun test tests/parallel-waves.integration.test.ts  # 4 end-to-end tests
 ```
 
-Cover hota hai: clamping, path-scope conflicts (`src` vs `src/a.ts`,
-case/backslash), undeclared writer, disjoint writers, writer cap, dependency
-blocking, failed dependency, running step re-schedule, ordered `boundedMap`
-(concurrency peak bhi assert hota hai), progress counting aur planner ke
-`files` parsing + sanitization (`/etc/passwd`, `..`, `C:\` drop).
+**Unit** (`parallel.test.ts`) — clamping, path-scope conflicts (`src` vs
+`src/a.ts`, case/backslash), undeclared writer, plan-order barrier, disjoint
+writers, writer cap, dependency blocking, failed dependency, running step
+re-schedule, ordered `boundedMap` (concurrency peak bhi assert hota hai),
+progress counting aur planner ke `files` parsing + sanitization
+(`/etc/passwd`, `..`, `C:\` drop).
+
+**Integration** (`parallel-waves.integration.test.ts`) — asli orchestrator,
+asli workspace + asli git snapshots; sirf DB (`tests/helpers/fake-db.ts`, ek
+in-memory Prisma-shim) aur LLM (injected `complete`) fake hain:
+
+1. do disjoint writers **sach me** ek saath chalte hain (peak concurrent LLM
+   calls ≥ 2) aur har step **exactly ek baar** chalta hai;
+2. same file wale do writers kabhi overlap nahi karte (peak writers = 1);
+3. `parallelism: 1` par LLM kabhi do baar ek saath nahi bulaya jaata;
+4. live events (`wave_start`, `step_progress` phases, `progress`) emitted +
+   monotonic `seq` ke saath replayable hain.
 
 Baaki suite: `bun test` → 773 + naye tests pass hone chahiye.
