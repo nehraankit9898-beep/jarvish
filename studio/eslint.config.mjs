@@ -19,6 +19,11 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     // React rules
     "react-hooks/exhaustive-deps": "off",
     "react-hooks/purity": "off",
+    // eslint-config-next 16 ships the react-hooks v6 compiler rules. This
+    // codebase uses the classic "load in an effect, then setState" pattern in
+    // ~40 panels; the rule is a perf hint, not a bug, so it stays visible as a
+    // warning instead of failing `npm run lint`.
+    "react-hooks/set-state-in-effect": "warn",
     "react/no-unescaped-entities": "off",
     "react/display-name": "off",
     "react/prop-types": "off",

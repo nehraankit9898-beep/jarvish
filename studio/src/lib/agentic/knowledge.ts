@@ -3,11 +3,13 @@
 // WHAT IS SUPPORTED
 //   * plain text and source files (md, txt, json, ts/js/py/… ) that can be
 //     read as UTF-8 text,
+//   * real office documents — pdf, docx, xlsx, pptx, odt/ods, rtf, epub — via
+//     documents.ts (dependency-free extraction; no OCR),
 //   * content that the user pastes directly.
 //
 // WHAT IS NOT SUPPORTED (and says so instead of pretending)
-//   * binary formats (pdf, docx, images, archives) → status 'unsupported' with
-//     a readable explanation.
+//   * images, scans and archives → status 'unsupported' with a readable
+//     explanation. A scanned PDF is detected and reported as needing OCR.
 //
 // SAFETY
 //   * A document can only be imported from INSIDE a task workspace (the
@@ -22,6 +24,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { db } from '@/lib/db';
 import { resolveSafe, isSafeTaskId } from './workspace';
+import { detectDocumentKind, extractDocumentText, DocumentError } from './documents';
 
 export type KnowledgeStatus = 'pending' | 'indexed' | 'failed' | 'unsupported';
 
@@ -81,6 +84,18 @@ const BINARY_EXTENSIONS = new Set([
 ]);
 
 const MAX_DOC_BYTES = 2_000_000;
+/** office documents are compressed containers — they may be larger on disk */
+const MAX_DOCUMENT_BYTES = 25_000_000;
+const MIME_BY_KIND: Record<string, string> = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  rtf: 'application/rtf',
+  epub: 'application/epub+zip',
+};
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 150;
 const MAX_CHUNKS = 2_000;
@@ -216,6 +231,7 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
   let name: string;
   let relPath = '';
   let size = 0;
+  let mime = input.mime ?? 'text/plain';
 
   if (typeof input.content === 'string') {
     if (!input.content.length) {
@@ -233,7 +249,11 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
     }
     relPath = String(input.path);
     const ext = path.extname(relPath).toLowerCase();
-    if (BINARY_EXTENSIONS.has(ext)) {
+    const kind = detectDocumentKind(ext);
+    // pdf/docx/xlsx/pptx/odt/ods/rtf/epub are binary BUT readable: they are
+    // unpacked by documents.ts instead of being refused
+    const isDocument = kind !== null && kind !== 'text' && kind !== 'csv';
+    if (BINARY_EXTENSIONS.has(ext) && !isDocument) {
       const doc = await db.knowledgeDoc.create({
         data: {
           name: input.name ?? path.basename(relPath),
@@ -241,15 +261,11 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
           mime: input.mime ?? 'application/octet-stream',
           size: 0,
           status: 'unsupported',
-          error: `Unsupported file type "${ext || 'unknown'}". Import a text-based file (md, txt, json, source code) instead.`,
+          error: `Unsupported file type "${ext || 'unknown'}". Supported: text/source files and pdf, docx, xlsx, pptx, odt, ods, rtf, epub.`,
           taskId,
         },
       });
       return toDto(doc);
-    }
-    if (!TEXT_EXTENSIONS.has(ext)) {
-      // not a known binary type and not a known text type → try to read it
-      // as text and fail gracefully when it is not valid UTF-8.
     }
     const abs = await resolveSafe(taskId, relPath);
     let stat;
@@ -261,8 +277,12 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
     if (!stat.isFile()) {
       throw new KnowledgeError('path', 'Only files can be imported');
     }
-    if (stat.size > MAX_DOC_BYTES) {
-      throw new KnowledgeError('path', 'Document is too large (max 2 MB)');
+    const maxBytes = isDocument ? MAX_DOCUMENT_BYTES : MAX_DOC_BYTES;
+    if (stat.size > maxBytes) {
+      throw new KnowledgeError(
+        'path',
+        `Document is too large (max ${(maxBytes / 1_000_000).toFixed(0)} MB)`
+      );
     }
     let buffer: Buffer;
     try {
@@ -270,25 +290,68 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
     } catch (err) {
       throw new KnowledgeError('path', `Could not read file: ${(err as Error).message}`);
     }
-    // A NUL byte in the first 4 KB is the classic "this is binary" signal.
-    const head = buffer.subarray(0, 4096);
-    if (head.includes(0)) {
-      const doc = await db.knowledgeDoc.create({
-        data: {
-          name: input.name ?? path.basename(relPath),
-          path: relPath,
-          mime: input.mime ?? 'application/octet-stream',
-          size: stat.size,
-          status: 'unsupported',
-          error: 'File appears to be binary — only text-based documents can be indexed.',
-          taskId,
-        },
-      });
-      return toDto(doc);
+    if (isDocument) {
+      // a real office/pdf document — extract its text, or say exactly why not
+      try {
+        const extracted = extractDocumentText(buffer, ext);
+        if (!extracted.text.trim()) {
+          const doc = await db.knowledgeDoc.create({
+            data: {
+              name: input.name ?? path.basename(relPath),
+              path: relPath,
+              mime: input.mime ?? MIME_BY_KIND[kind] ?? 'application/octet-stream',
+              size: stat.size,
+              status: 'unsupported',
+              error:
+                extracted.warnings.join(' ') ||
+                'No extractable text was found in this document.',
+              taskId,
+            },
+          });
+          return toDto(doc);
+        }
+        text = extracted.text;
+        mime = input.mime ?? MIME_BY_KIND[extracted.kind] ?? 'application/octet-stream';
+      } catch (err) {
+        const message =
+          err instanceof DocumentError ? err.message : `Could not read document: ${(err as Error).message}`;
+        const doc = await db.knowledgeDoc.create({
+          data: {
+            name: input.name ?? path.basename(relPath),
+            path: relPath,
+            mime: input.mime ?? MIME_BY_KIND[kind] ?? 'application/octet-stream',
+            size: stat.size,
+            status: 'unsupported',
+            error: message,
+            taskId,
+          },
+        });
+        return toDto(doc);
+      }
+      name = input.name ?? path.basename(relPath);
+      size = stat.size;
+    } else {
+      // A NUL byte in the first 4 KB is the classic "this is binary" signal.
+      const head = buffer.subarray(0, 4096);
+      if (head.includes(0)) {
+        const doc = await db.knowledgeDoc.create({
+          data: {
+            name: input.name ?? path.basename(relPath),
+            path: relPath,
+            mime: input.mime ?? 'application/octet-stream',
+            size: stat.size,
+            status: 'unsupported',
+            error: 'File appears to be binary — only text-based documents can be indexed.',
+            taskId,
+          },
+        });
+        return toDto(doc);
+      }
+      text = buffer.toString('utf-8');
+      name = input.name ?? path.basename(relPath);
+      size = stat.size;
+      mime = input.mime ?? 'text/plain';
     }
-    text = buffer.toString('utf-8');
-    name = input.name ?? path.basename(relPath);
-    size = stat.size;
   } else {
     throw new KnowledgeError('content', 'Either content or path is required');
   }
@@ -298,7 +361,7 @@ export async function importDocument(input: ImportInput): Promise<KnowledgeDocDt
     data: {
       name,
       path: relPath,
-      mime: input.mime ?? (relPath ? 'text/plain' : 'text/plain'),
+      mime,
       size,
       status: chunks.length ? 'indexed' : 'failed',
       error: chunks.length ? '' : 'Document is empty',

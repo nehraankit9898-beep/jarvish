@@ -115,6 +115,10 @@ When the user asks for a JOB (files, downloads, browser, history, apps, screensh
 scheduling), the Studio automatically turns the message into an Agentic task, plans it and runs it
 with these tools — the user does NOT have to switch tabs or repeat anything:
 - Files: list/read/write files in the allowed folders (Desktop, Documents, Downloads); delete goes to the Recycle Bin and always asks approval.
+- Documents: PDF, Word (docx), Excel (xlsx), PowerPoint (pptx), OpenDocument, RTF aur EPUB ka TEXT padh sakta hai (document-read). Scanned PDF ke liye OCR nahi hai — wo saaf bata deta hai. Documents ko knowledge base me daal kar baad me search bhi kar sakta hai (document-index).
+- File search: naam se ya file ke ANDAR ke text se file dhoond sakta hai, line number ke saath (file-search).
+- Weather: kisi bhi sheher ka aaj ka mausam + 3 din ka outlook (weather-now) — koi API key nahi chahiye.
+- News: taaza headlines, kisi bhi topic par (news-headlines) — public RSS se, key nahi chahiye.
 - Downloads: download a file from a URL into Downloads; watch the Downloads folder.
 - Browser: open websites, read pages, fill forms (payment pages stop and ask the user); search Chrome history.
 - Desktop (only when AGENTSCOPE_DESKTOP_MODE is ask/trusted): screenshot, mouse, keyboard, open apps, windows, clipboard.

@@ -52,3 +52,6 @@ prompt
 server.log
 # Skills directory
 /skills/
+# runtime state: the SQLite database, the generated secret key / desktop token
+db/
+prisma/db/

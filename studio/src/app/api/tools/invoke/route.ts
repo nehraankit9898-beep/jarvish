@@ -7,6 +7,8 @@ import { recordAudit, clientIp } from '@/lib/agentic/audit';
 import { registerBrowserTools } from '@/lib/agentic/browser-tools';
 import { registerHostTools } from '@/lib/agentic/host-tools';
 import { registerLaptopTools } from '@/lib/agentic/laptop-tools';
+import { registerDocumentTools } from '@/lib/agentic/document-tools';
+import { registerInfoTools } from '@/lib/agentic/info-tools';
 import { loadActiveCustomTools } from '@/lib/agentic/custom-tools';
 
 export const runtime = 'nodejs';
@@ -50,6 +52,8 @@ export async function POST(req: NextRequest) {
     registerBrowserTools();
     registerHostTools();
     registerLaptopTools();
+    registerDocumentTools();
+    registerInfoTools();
     await loadActiveCustomTools().catch(() => 0);
 
     const result = await invokeTool({
