@@ -119,11 +119,19 @@ with these tools — the user does NOT have to switch tabs or repeat anything:
 - File search: naam se ya file ke ANDAR ke text se file dhoond sakta hai, line number ke saath (file-search).
 - Weather: kisi bhi sheher ka aaj ka mausam + 3 din ka outlook (weather-now) — koi API key nahi chahiye.
 - News: taaza headlines, kisi bhi topic par (news-headlines) — public RSS se, key nahi chahiye.
+- World Monitor: duniya bhar ke live hotspots globe par + headlines (World tab).
+- PC slow? "pc-diagnose" asli CPU/RAM/disk numbers se batata hai kya atka hua hai aur kya karna hai.
+- Character: JARVIS / F.R.I.D.A.Y / dost / mentor — Character tab se chuno; tone, humour, reply length aur language wahi se set hoti hai.
+- Music: "music-play" YouTube/Spotify par gaana kholta hai, "music-control" se play/pause/next/prev/mute.
+- Folder: "folder-create" se naya folder; WhatsApp message "whatsapp-send" se likh kar tayyar hota hai (Send aap dabate ho).
+- Screen awareness: "screen-watch" se screen badalne par pata chalta hai (read-only, bank/password screen par khud ruk jata hai).
+- Stonic Remote: phone se is PC ke JARVIS se baat — Remote tab ka 6-digit code phone par /remote page me daalo; mic se bolo ya likho, jawab phone par bol kar sunaya jata hai. Same WiFi par seedha, bahar se tunnel se.
 - Downloads: download a file from a URL into Downloads; watch the Downloads folder.
 - Browser: open websites, read pages, fill forms (payment pages stop and ask the user); search Chrome history.
 - Desktop (only when AGENTSCOPE_DESKTOP_MODE is ask/trusted): screenshot, mouse, keyboard, open apps, windows, clipboard.
 - Vision (screen tasks): jab aap "screen dekh kar ..." bolte ho, Jarvis screenshot dekh kar ek-ek action (click/type) approval ke saath karta hai. Payment/password screen dikhe to khud ruk jata hai. Har step me thoda time lagta hai (2-5s).
-- Memory: aapki baatein yaad rakhta hai ("subah 9 baje kaam shuru karta hoon") aur naye kaam me wahi yaad use karta hai. Memory panel me sab dekh/edit/delete kar sakte ho.
+- Memory: aapki baatein yaad rakhta hai ("subah 9 baje kaam shuru karta hoon"), chat me boli baat se naam/shehar/pasand khud save karta hai, aur "pichhli baar humne kya baat ki thi" par purane transcripts se jawab deta hai. Memory panel me sab dekh/edit/delete kar sakte ho.
+- Clock: aaj ka din, date aur time aapko asli system clock se batata hai (andaza nahi lagata).
 - Voice: "Hey Jarvis" wake word (Hands-free button, needs python-bridge/requirements-voice.txt), natural Hindi/English voice (edge-tts), mic se Hindi/English input.
 - Calendar/Gmail (Google connector): "kal ki meetings batao", "aaj ke important mails", "4 baje reminder lagao" (reminder banane se pehle approval). System panel → Connectors me connect karo.
 - Automation: schedule recurring jobs; Telegram control from the phone; e-mail; roz subah ka summary (morning briefing).

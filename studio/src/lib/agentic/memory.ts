@@ -286,6 +286,47 @@ function tokenize(text: string): string[] {
     .filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
 }
 
+/**
+ * Hinglish <-> English aliases.
+ *
+ * A memory saved as `user name` must be found by the question "mera naam kya
+ * hai" — "naam" and "name" are the same word to the user. Retrieval expands
+ * both sides, so the language of the QUESTION and the language of the stored
+ * KEY never have to match.
+ */
+const SYNONYMS: Record<string, string[]> = {
+  naam: ['name'],
+  name: ['naam'],
+  shehar: ['city', 'shahar'],
+  shahar: ['city', 'shehar'],
+  city: ['shehar', 'shahar'],
+  ghar: ['home', 'city'],
+  home: ['ghar'],
+  kaam: ['work', 'occupation', 'job'],
+  work: ['kaam', 'occupation', 'job'],
+  job: ['kaam', 'work', 'occupation'],
+  naukri: ['kaam', 'work', 'job'],
+  occupation: ['kaam', 'work', 'job'],
+  pasand: ['like', 'favourite', 'favorite'],
+  like: ['pasand'],
+  favourite: ['pasand'],
+  favorite: ['pasand'],
+  birthday: ['janamdin', 'janmdin'],
+  janamdin: ['birthday'],
+  janmdin: ['birthday'],
+  umar: ['age'],
+  age: ['umar'],
+};
+
+function expand(words: string[]): string[] {
+  const out = new Set<string>();
+  for (const word of words) {
+    out.add(word);
+    for (const alias of SYNONYMS[word] ?? []) out.add(alias);
+  }
+  return Array.from(out);
+}
+
 export interface RelevantMemory {
   id: string;
   key: string;
@@ -305,10 +346,10 @@ export async function findRelevantMemories(
 ): Promise<RelevantMemory[]> {
   const rows = await listMemory({ scope: 'user', limit: 200 });
   if (!rows.length) return [];
-  const want = new Set(tokenize(query));
+  const want = new Set(expand(tokenize(query)));
   const now = Date.now();
   const scored = rows.map((m) => {
-    const hay = tokenize(`${m.key} ${m.content}`);
+    const hay = expand(tokenize(`${m.key} ${m.content}`));
     let overlap = 0;
     for (const w of new Set(hay)) if (want.has(w)) overlap++;
     // exact key phrase hit is a strong signal ("naam", "birthday" ...)

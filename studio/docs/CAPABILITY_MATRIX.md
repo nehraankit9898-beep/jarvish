@@ -13,7 +13,11 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Voice me jawab | ✅ | edge-tts, Hindi voice |
 | Hindi/English baat-cheet | ✅ | LLM |
 | Context yaad rakhna / follow-up | ✅ | conversations + `memory.ts` |
-| Personality / tone set karna | 🟡 | per-agent prompt (Agent registry); dedicated tone setting nahi mila |
+| Long-term memory (naam, shehar, pasand) | 🆕 | `recollect.ts` — chat me boli baat se fact nikal kar `memory.ts` me save, phir prompt me recall. Question yaad nahi banta, credential refuse |
+| "Aaj kaunsa din/date/time hai" | 🆕 | `timeContext()` — real clock (weekday, date, time, timezone) har prompt me + `time-now` tool |
+| Purani baatein yaad karna | 🆕 | `conversation-recall` tool + auto-inject on "pichhli baar…" — asli transcripts se top 5 excerpts |
+| Personality / tone set karna | ✅ | **Character** tab: 5 persona (JARVIS / F.R.I.D.A.Y / Buddy / Mentor / Studio), nickname, humour + reply-length sliders, language — server-side (`persona.ts`), chat prompt me jaata hai |
+| Male / female / animated character | ✅ | `jarvis-avatar.tsx` (SVG + CSS, gender variants, idle/listening/thinking/speaking states) |
 
 ## Computer & System
 | Feature | Status | Tool |
@@ -28,6 +32,10 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Brightness | 🆕 | `desktop-brightness` (5–100, Windows panel) |
 | WiFi on/off + status | 🆕 | `desktop-wifi-set` (Administrator chahiye), `desktop-wifi-status` |
 | Bluetooth on/off | ❌ | workaround: `desktop-open-app` target `ms-settings:bluetooth` |
+| Folder banana | ✅ | `folder-create` (approval-gated `mkdir` host action) |
+| PC slow kyun hai (diagnosis) | ✅ | `pc-diagnose` + `/api/system/pc-health` — ranked findings, score/100 |
+| Music / playlist control | ✅ | `music-play` (YouTube search / Spotify) + `music-control` (media keys) |
+| WhatsApp message | 🟡 | `whatsapp-send` — WhatsApp Desktop me text tayyar hota hai, **Send user dabata hai** |
 | Mouse / keyboard / typing / clipboard | ✅ | `desktop-click/type/hotkey/scroll/clipboard-*` |
 | Screenshot | ✅ | `desktop-screenshot` |
 | Screen recording | 🆕 | `desktop-screen-record` (max 60 s, kill switch rokta hai) |
@@ -44,6 +52,7 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Google search, YouTube search | 🟡 | browser se search URL khol ke; dedicated search tool nahi |
 | Weather | ✅ | `weather-now` (Open-Meteo, key ki zaroorat nahi) |
 | News / headlines | ✅ | `news-headlines` (public RSS, topic-wise) |
+| **World Monitor** (live globe + hotspots) | ✅ | **World** tab: canvas globe (orthographic, drag, pulse), GDELT geo hotspots (24 h) + live headlines, `degraded` banner jab source down ho |
 
 ## Data & Research
 | Feature | Status | Note |
@@ -51,6 +60,7 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Text / code docs summarize | ✅ | knowledge base |
 | PDF / DOCX / XLSX / PPTX / ODT / RTF / EPUB padhna | ✅ | `documents.ts` (koi naya dependency nahi) + `document-read` tool + knowledge base import |
 | OCR (scanned PDF / photo ka text) | ❌ | `document-read` scan detect kar ke saaf bata deta hai ki OCR chahiye; OCR engine nahi hai |
+| Screen awareness (continuous) | 🟡 | `screen-watch` + `/api/screen/watch`: periodic screenshot → perceptual hash → **change events**; bank/password window par auto-pause. Samajhna (interpretation) abhi existing vision loop karta hai |
 | Charts banana | ❌ | UI me recharts hai, agent tool nahi |
 
 ## Scheduling
@@ -72,7 +82,8 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Paani / break / stretch reminders | ❌ (schedule bana ke ho sakta hai, built-in rule nahi) |
 | Google Drive / OneDrive | ❌ (connector sirf Calendar + Gmail) |
 | Telegram | 🟡 bot connector hai (Web control nahi) · WhatsApp ❌ |
-| Music / playlist | 🟡 `desktop-open-app` se URL/file khulta hai; playlist ❌ |
+| Music / playlist | ✅ `music-play` + `music-control` (playlist ❌) |
+| **Stonic Remote** (phone se JARVIS) | ✅ **Remote** tab: 6-digit pairing code → phone `/remote` page → mic/text se baat, jawab awaaz me; session token (256-bit), 3 min code TTL, 2 h idle expiry, PC se instant disconnect, kill switch par band |
 
 ## Safety (naye features par bhi)
 - Har naya mutating endpoint `destructive` classify hota hai → **har baar approval**, trusted mode me bhi.
