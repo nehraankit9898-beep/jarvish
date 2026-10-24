@@ -34,7 +34,7 @@ Poori guide: [`studio/docs/WINDOWS_SETUP.md`](studio/docs/WINDOWS_SETUP.md)
 ```bash
 cd agentscope-suite/studio
 npm install          # ya: bun install
-npx prisma db push   # SQLite database ready
+npm run setup       # private .env + Prisma client + SQLite schema (no reset)
 npm run dev          # http://localhost:3000
 ```
 
@@ -45,7 +45,7 @@ Health check (Windows):
 
 ### 2) API connection (easy)
 
-Studio kholte hi **Z.ai built-in engine** free chalta hai (koi key nahi chahiye).
+Real AI responses ke liye **configured provider** zaroori hai. Z.ai built-in engine sirf compatible SDK credentials/configuration available hone par chalta hai; fresh install par free access guaranteed nahi hai.
 Apni keys ke liye: **API Settings** → provider chuno (OpenAI / Claude / Gemini / DeepSeek / Qwen / Kimi / Grok / Ollama / Custom) → key paste → **Test Connection** → **Use this provider**.
 
 > Browser ki localStorage wala flow abhi bhi kaam karta hai. Naya **server-side** flow bhi hai: **Providers** panel me key daalo — wo **encrypted** (AES-256-GCM) server par store hoti hai aur browser ko kabhi wapas nahi bheji jati (sirf `••••1234` hint). Usi panel se provider enable/disable, priority, cost class (free/paid), timeout/retry, per-agent model preference aur **free-only mode** set hota hai — free-only me paid model kabhi select nahi hota.
@@ -293,3 +293,9 @@ Setup (kuch naya install nahi):
 "# Jarvish" 
 "# Jarvish" 
 "# jarvish" 
+
+
+## JARVIS reliability update
+
+See [setup and verification notes](studio/docs/JARVIS_READINESS.md) for local setup,
+security, tested fixes, and remaining deployment requirements.

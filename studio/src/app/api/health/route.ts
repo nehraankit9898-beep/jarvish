@@ -19,11 +19,11 @@ export async function GET() {
   try {
     await db.$queryRaw`SELECT 1`;
     database = { ok: true, latencyMs: Date.now() - startedAt, error: '' };
-  } catch (err) {
+  } catch {
     database = {
       ok: false,
       latencyMs: Date.now() - startedAt,
-      error: err instanceof Error ? err.message : 'database unavailable',
+      error: 'Database unavailable',
     };
   }
 
@@ -36,5 +36,5 @@ export async function GET() {
     },
   };
 
-  return NextResponse.json(body, { status: database.ok ? 200 : 503 });
+  return NextResponse.json(body, { status: database.ok ? 200 : 503, headers: { 'Cache-Control': 'no-store' } });
 }

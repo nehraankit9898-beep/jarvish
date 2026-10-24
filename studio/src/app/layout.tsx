@@ -1,24 +1,9 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono, Orbitron } from "next/font/google";
+import '@fontsource-variable/geist';
+import '@fontsource-variable/geist-mono';
+import '@fontsource/orbitron/500.css';
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
-// JARVIS HUD display font — brand title + reactor captions only (body text
-// stays Geist/Geist Mono for readability). Variable font → no weight list.
-const orbitron = Orbitron({
-  variable: "--font-orbitron",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   title: "AgentScope Studio — J.A.R.V.I.S Command Center",
@@ -26,7 +11,7 @@ export const metadata: Metadata = {
     "JARVIS-style command center over the AgentScope agentic engine: real streaming chat, multi-agent task execution, laptop control with approval gates, and 10+ LLM providers.",
   keywords: ["AgentScope", "JARVIS", "AI agent", "multi-provider", "OpenAI", "Claude", "Gemini", "chat"],
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: "/logo.svg",
   },
 };
 
@@ -41,7 +26,7 @@ export default function RootLayout({
     // (dialogs, toasts) inherit the theme too.
     <html lang="en" className="jarvis-scope" suppressHydrationWarning>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} ${orbitron.variable} antialiased bg-background text-foreground`}
+        className={"antialiased bg-background text-foreground"}
       >
         <a
           href="#main"
