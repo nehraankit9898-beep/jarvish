@@ -4,13 +4,7 @@ import { db } from '@/lib/db';
 import { isSafeTaskId } from '@/lib/agentic/workspace';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { recordAudit, clientIp } from '@/lib/agentic/audit';
-import { registerBrowserTools } from '@/lib/agentic/browser-tools';
-import { registerHostTools } from '@/lib/agentic/host-tools';
-import { registerLaptopTools } from '@/lib/agentic/laptop-tools';
-import { registerDocumentTools } from '@/lib/agentic/document-tools';
-import { registerInfoTools } from '@/lib/agentic/info-tools';
-import { registerPcTools } from '@/lib/agentic/pc-tools';
-import { loadActiveCustomTools } from '@/lib/agentic/custom-tools';
+import { ensureFullToolCatalog } from '@/lib/agentic/tool-catalog';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -50,13 +44,12 @@ export async function POST(req: NextRequest) {
 
     // the browser tools and approved custom tools join the catalog lazily,
     // right before the first invocation
-    registerBrowserTools();
-    registerHostTools();
-    registerLaptopTools();
-    registerDocumentTools();
-    registerInfoTools();
-    registerPcTools();
-    await loadActiveCustomTools().catch(() => 0);
+    // H36: this used to hand-pick SIX families — memory, recollect and
+    // connector tools were never registered here, so the UI could SEE them in
+    // GET /api/tools and then get "Unknown tool" when invoking one. The shared
+    // catalog is the single source of truth for what "the tools are loaded"
+    // means, so listing, invoking and health-checking can never disagree.
+    await ensureFullToolCatalog();
 
     const result = await invokeTool({
       tool,

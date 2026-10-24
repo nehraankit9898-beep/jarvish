@@ -10,9 +10,17 @@
 //   4. DISABLED / REJECTED — off.
 //
 // SECURITY MODEL (mirrors the platform spec):
-//   - the tool code is a plain async function body — NO require/import/
-//     process/eval, enforced by a static scan BEFORE approval and again at
-//     load time;
+//   - the tool code is a plain async function body executed in a DEDICATED
+//     V8 context (node:vm) whose global object contains ONLY what is listed in
+//     TOOL_SANDBOX_GLOBALS. `process`, `require`, `fs`, the host `fetch` and
+//     the host intrinsics are structurally absent, and string code generation
+//     (eval / new Function) is switched off for that context, so the classic
+//     `Function("return this")()` / `""["constructor"]` escapes cannot reach
+//     the host realm;
+//   - a static scan (see FORBIDDEN_CODE_PATTERNS) runs BEFORE approval and
+//     again at load time so obviously hostile code is rejected with a clear
+//     reason instead of failing at runtime (defence in depth, not the
+//     boundary itself);
 //   - the ONLY way out is `api.fetch` — the SAME SSRF-guarded HTTP the
 //     provider connections use, locked to the tool's declared baseUrl;
 //   - a custom tool NEVER sees production credentials: no env access, no
@@ -20,6 +28,7 @@
 //   - every invocation is audited and counted.
 
 import { z } from 'zod';
+import vm from 'node:vm';
 import { db } from '@/lib/db';
 import {
   registerTool,
@@ -71,29 +80,60 @@ export class CustomToolError extends Error {
 
 /** Tokens a custom tool must NEVER contain (checked at save AND load time). */
 const FORBIDDEN_CODE_PATTERNS: Array<{ pattern: RegExp; why: string }> = [
+  // These patterns are CODE-shaped (a call, a member access), not word-shaped,
+  // so ordinary prose in a string or comment ("this requires a key") does not
+  // trip the scan. They exist to give a clear reason at save time — the real
+  // boundary is the sandbox context itself (see runToolCode).
   { pattern: /\brequire\s*\(/, why: 'require() is not available in the tool sandbox' },
-  { pattern: /\bimport\s+/, why: 'import statements are not available in the tool sandbox' },
-  { pattern: /\bprocess\b/, why: 'process access is not available (no env credentials)' },
+  { pattern: /\bimport\s*\(|\bimport\s+[\w{*]/, why: 'import statements are not available in the tool sandbox' },
+  { pattern: /\bprocess\s*\./, why: 'process access is not available (no env credentials)' },
   { pattern: /\bglobalThis\b/, why: 'globalThis access is not allowed' },
+  // H8: the old scan only rejected `eval(` and `new Function`, so
+  // `Function("return process")()` and the `""["constructor"]["constructor"]`
+  // chain walked straight out of the "sandbox". Any code generation and any
+  // realm hop is refused now.
   { pattern: /\beval\s*\(/, why: 'eval() is not allowed' },
-  { pattern: /\bnew\s+Function\b/, why: 'new Function() is not allowed' },
-  { pattern: /\b__proto__\b/, why: 'prototype access is not allowed' },
-  { pattern: /\bconstructor\s*\[/, why: 'constructor access is not allowed' },
-  { pattern: /\bBuffer\b/, why: 'Buffer access is not allowed' },
-  { pattern: /\bdocument\b|\bwindow\b/, why: 'browser globals do not exist in the tool sandbox' },
+  { pattern: /\bFunction\s*\(|\bnew\s+Function\b/, why: 'the Function constructor is not allowed (no code generation)' },
+  { pattern: /\.\s*constructor\b|\bconstructor\s*\[|\bprototype\b|__proto__/, why: 'prototype / constructor access is not allowed' },
+  { pattern: /\bgetPrototypeOf\b|\bsetPrototypeOf\b|\bdefineProperty\b/, why: 'prototype manipulation is not allowed' },
+  { pattern: /\bReflect\s*[.[]|\bWebAssembly\b/, why: 'Reflect/WebAssembly are not available in the tool sandbox' },
+  { pattern: /\bBuffer\s*[.([]/, why: 'Buffer access is not allowed' },
+  { pattern: /\b(?:document|window)\s*[.[]/, why: 'browser globals do not exist in the tool sandbox' },
+  // `api.fetch` is the ONLY network path (SSRF-guarded + baseUrl-locked), so a
+  // raw global fetch must not be reachable.
+  { pattern: /(?<![.\w$])fetch\s*\(/, why: 'use api.fetch() — the raw global fetch is not available' },
 ];
+
 
 export function scanToolCode(code: string): { ok: true } | { ok: false; reason: string } {
   for (const { pattern, why } of FORBIDDEN_CODE_PATTERNS) {
     if (pattern.test(code)) return { ok: false, reason: why };
   }
-  // the code must be syntactically valid as an async function body
+  // the code must be syntactically valid as an async function body — compiled
+  // exactly the way the sandbox runs it, so a tool cannot save fine and then
+  // fail at invocation time
   try {
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    new Function('params', 'api', `"use strict";\nreturn (async () => {\n${code}\n})();`);
+    new vm.Script(wrapToolCode(code), { filename: 'custom-tool.js' });
     return { ok: true };
   } catch (err) {
-    return { ok: false, reason: `Syntax error in tool code: ${err instanceof Error ? err.message : 'unknown'}` };
+    return { ok: false, reason: `Syntax error in tool code: ${errorMessage(err)}` };
+  }
+}
+
+/** The tool body wrapped in a strict, awaitable async IIFE. */
+function wrapToolCode(code: string): string {
+  return `"use strict";\n(async () => {\n${code}\n})()`;
+}
+
+/** A sandboxed script throws its OWN Error class, so `instanceof` cannot be used. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  const maybe = err as { message?: unknown } | null;
+  if (maybe && typeof maybe.message === 'string') return maybe.message;
+  try {
+    return String(err);
+  } catch {
+    return 'unknown error';
   }
 }
 
@@ -254,6 +294,12 @@ export async function deleteCustomTool(id: string): Promise<boolean> {
   const row = await db.customTool.findUnique({ where: { id } });
   if (!row) return false;
   await db.customTool.delete({ where: { id } });
+  // H9: a deleted tool used to stay REGISTERED (and callable) until the next
+  // restart — the DB row was gone, so every later call ran orphaned code that
+  // could no longer be audited, disabled or reviewed. Take it out of the live
+  // registry now.
+  unregisterTool(row.name);
+  LIVE_CUSTOM_TOOLS.delete(row.name);
   await recordAudit({
     actor: 'user',
     action: 'tool.delete',
@@ -353,6 +399,96 @@ function makeToolApi(tool: LoadedCustomTool, onLog: (line: string) => void) {
   };
 }
 
+/** Hard cap on a single tool invocation (the sync part is killed at this point). */
+export const TOOL_SANDBOX_TIMEOUT_MS = 30_000;
+
+/**
+ * The globals a custom tool can see. Everything the host has and is NOT listed
+ * here simply does not exist inside the sandbox — no `process`, no `require`,
+ * no filesystem, no host `fetch`, no provider store, no env.
+ */
+const TOOL_SANDBOX_GLOBALS = [
+  'URL',
+  'URLSearchParams',
+  'TextEncoder',
+  'TextDecoder',
+  'AbortController',
+  'AbortSignal',
+] as const;
+
+/**
+ * H8: run the tool body in a DEDICATED V8 context instead of a host-realm
+ * `new Function`. Inside that context `Function`, `eval` and
+ * `""["constructor"]["constructor"]` resolve to the SANDBOX realm and string
+ * code generation is disabled outright (`codeGeneration.strings: false`), so
+ * compiled strings can no longer reach the host realm and read
+ * `process.env`/the provider store. Timers are capped and always torn down
+ * with the invocation, so a tool cannot outlive its own call.
+ */
+function runToolCode(
+  code: string,
+  params: Record<string, unknown>,
+  api: unknown,
+  timeoutMs = TOOL_SANDBOX_TIMEOUT_MS
+): Promise<unknown> {
+  const timers = new Set<ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>>();
+  const clearAll = () => {
+    for (const t of timers) {
+      clearTimeout(t as ReturnType<typeof setTimeout>);
+      clearInterval(t as ReturnType<typeof setInterval>);
+    }
+    timers.clear();
+  };
+  const clamp = (ms: unknown, min: number, max: number) =>
+    Math.min(Math.max(min, Number.isFinite(Number(ms)) ? Number(ms) : min), max);
+
+  const sandbox: Record<string, unknown> = { params, api };
+  for (const name of TOOL_SANDBOX_GLOBALS) sandbox[name] = globalThis[name as keyof typeof globalThis];
+  sandbox.setTimeout = (fn: unknown, ms: unknown = 0, ...args: unknown[]) => {
+    const delay = clamp(ms, 0, timeoutMs);
+    const id = setTimeout(() => {
+      timers.delete(id);
+      if (typeof fn === 'function') (fn as (...a: unknown[]) => void)(...args);
+    }, delay);
+    timers.add(id);
+    return id;
+  };
+  sandbox.clearTimeout = (id: unknown) => {
+    if (id !== undefined && id !== null) clearTimeout(id as ReturnType<typeof setTimeout>);
+    timers.delete(id as ReturnType<typeof setTimeout>);
+  };
+  sandbox.setInterval = (fn: unknown, ms: unknown = 1000, ...args: unknown[]) => {
+    const every = clamp(ms, 1000, 60_000);
+    const id = setInterval(() => {
+      if (typeof fn === 'function') (fn as (...a: unknown[]) => void)(...args);
+    }, every);
+    timers.add(id);
+    return id;
+  };
+  sandbox.clearInterval = (id: unknown) => {
+    if (id !== undefined && id !== null) clearInterval(id as ReturnType<typeof setInterval>);
+    timers.delete(id as ReturnType<typeof setInterval>);
+  };
+
+  let context: vm.Context;
+  try {
+    context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+  } catch {
+    context = vm.createContext(sandbox);
+  }
+  const script = new vm.Script(wrapToolCode(code), { filename: 'custom-tool.js' });
+  let value: unknown;
+  try {
+    // `timeout` bounds the SYNCHRONOUS part — an infinite loop in a tool can
+    // no longer wedge the whole Studio process
+    value = script.runInContext(context, { timeout: timeoutMs, breakOnSigint: false });
+  } catch (err) {
+    clearAll();
+    throw err;
+  }
+  return Promise.resolve(value).finally(clearAll);
+}
+
 function loadCustomToolIntoRegistry(row: {
   id: string;
   name: string;
@@ -384,19 +520,17 @@ function loadCustomToolIntoRegistry(row: {
   registerTool(def, async (invocation: ToolInvocation): Promise<ToolResult> => {
     const at = new Date().toISOString();
     const logs: string[] = [];
-    // compile per invocation (fresh scope, no state leaks between calls)
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    const fn = new Function(
-      'params',
-      'api',
-      `"use strict";\nreturn (async () => {\n${tool.row.code}\n})();`
-    ) as (params: Record<string, unknown>, api: unknown) => Promise<unknown>;
-
+    // a FRESH sandbox per invocation — no state leaks between calls and no
+    // shared global object to poison
     let result: unknown;
     try {
-      result = await fn(invocation.parameters, makeToolApi(tool, (l) => logs.push(l)));
+      result = await runToolCode(
+        tool.row.code,
+        invocation.parameters ?? {},
+        makeToolApi(tool, (l) => logs.push(l))
+      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Tool execution failed';
+      const message = errorMessage(err) || 'Tool execution failed';
       await db.customTool
         .update({
           where: { id: tool.row.id },

@@ -348,7 +348,15 @@ export async function resetProjectIndex(root: string): Promise<number> {
     select: { id: true },
   });
   if (!docs.length) return 0;
-  await db.knowledgeDoc.deleteMany({ where: { id: { in: docs.map((d) => d.id) } } });
+  const ids = docs.map((d) => d.id);
+  // H26: only the DOCUMENT rows were removed. The chunk rows — the actual text
+  // of every indexed file — were left behind, expected to disappear through the
+  // `onDelete: Cascade` relation. That cascade only fires on a connection with
+  // `PRAGMA foreign_keys = ON`, so "Clear index" could leave the whole project's
+  // source text sitting in SQLite, unreachable from the UI and unremovable by
+  // the user. Delete them explicitly; indexOne() already did exactly that.
+  await db.knowledgeChunk.deleteMany({ where: { docId: { in: ids } } });
+  await db.knowledgeDoc.deleteMany({ where: { id: { in: ids } } });
   return docs.length;
 }
 
@@ -385,6 +393,9 @@ async function indexOne(
   const chunks = chunkText(guarded.masked).slice(0, budget);
   if (!chunks.length) {
     if (existing) {
+      // H26: same as resetProjectIndex — the document AND its chunks must go
+      // together, or the stale text of a file that is now empty stays indexed.
+      await db.knowledgeChunk.deleteMany({ where: { docId: existing.id } });
       await db.knowledgeDoc.deleteMany({ where: { id: existing.id } });
     }
     return { ok: false, chunks: 0, skippedReason: 'empty' };
@@ -480,9 +491,17 @@ export async function indexProject(
     // files that vanished are removed from the index
     for (const s of stale) {
       if (s.reason === 'deleted') {
-        await db.knowledgeDoc.deleteMany({
+        const gone = await db.knowledgeDoc.findFirst({
           where: { source: 'project', sourceRoot: root, path: s.path },
+          select: { id: true },
         });
+        if (gone) {
+          // H26: the document and its chunks are removed together (see
+          // resetProjectIndex) — a deleted source file must not leave its text
+          // behind in the index.
+          await db.knowledgeChunk.deleteMany({ where: { docId: gone.id } });
+          await db.knowledgeDoc.deleteMany({ where: { id: gone.id } });
+        }
         files++;
       }
     }

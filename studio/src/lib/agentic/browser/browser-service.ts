@@ -361,8 +361,17 @@ export async function navigate(
     throw new BrowserError('Only http(s) URLs are allowed');
   }
   // the browser obeys the SAME SSRF policy as the provider connections
-  // (loopback only with the explicit opt-in — see loopbackAllowed())
-  await assertOutboundUrl(parsed.toString(), { allowLoopback: loopbackAllowed() });
+  // (loopback only with the explicit opt-in — see loopbackAllowed()).
+  // H16: `requireHttps` is dropped here on purpose. It exists so an LLM
+  // provider base URL cannot be dialed over cleartext; a WEB BROWSER is
+  // different — refusing http:// made the tool reject plain-http links it had
+  // just advertised as allowed ("Only http(s) URLs are allowed"), including
+  // local dev sites that are not on loopback. Every address rule still
+  // applies: private, link-local and metadata targets stay blocked.
+  await assertOutboundUrl(parsed.toString(), {
+    allowLoopback: loopbackAllowed(),
+    requireHttps: false,
+  });
   await db.browserSession.update({ where: { id: sessionId }, data: { status: 'navigating' } });
   try {
     await live.page.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 45_000 });

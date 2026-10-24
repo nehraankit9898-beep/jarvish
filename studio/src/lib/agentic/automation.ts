@@ -364,10 +364,15 @@ export async function startScheduleRun(
   // pass the check during the await and both start a run. The claim is now
   // taken SYNCHRONOUSLY (check + add with no await in between) before any
   // database busy-check, which closes the race inside the process.
-  const alreadyClaimed = starting.has(scheduleId);
-  if (!alreadyClaimed) starting.add(scheduleId);
+  //
+  // H6: the claim is only released by the call that TOOK it. Releasing it in a
+  // `finally` unconditionally meant a *skipped* duplicate deleted the in-flight
+  // starter's claim, so the next tick saw an unclaimed schedule whose run row
+  // had not been created yet — and started a second, concurrent run.
+  const claimed = !starting.has(scheduleId);
+  if (claimed) starting.add(scheduleId);
   try {
-    if (alreadyClaimed || (await dbBusy(scheduleId))) {
+    if (!claimed || (await dbBusy(scheduleId))) {
       const skipped = await db.automationRun.create({
         data: {
           scheduleId,
@@ -474,7 +479,8 @@ export async function startScheduleRun(
     const finished = await db.automationRun.findUnique({ where: { id: run.id } });
     return toRunDto(finished!);
   } finally {
-    starting.delete(scheduleId);
+    // H6: only the caller that TOOK the claim may drop it
+    if (claimed) starting.delete(scheduleId);
   }
 }
 

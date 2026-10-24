@@ -4,6 +4,7 @@ import { db } from '@/lib/db';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { listProviderConfigs, readStudioSettings } from '@/lib/agentic/provider-store';
 import { listTools, healthCheckTool } from '@/lib/agentic/tool-registry';
+import { ensureFullToolCatalog } from '@/lib/agentic/tool-catalog';
 import { validateEnv } from '@/lib/agentic/env';
 
 export const runtime = 'nodejs';
@@ -140,6 +141,9 @@ export async function GET(req: NextRequest) {
     broken: 0,
   };
   try {
+    // H35: the catalog has to be assembled before it can be counted (this
+    // route never registered any tool family, so the tile showed 0/0/0).
+    await ensureFullToolCatalog();
     const list = listTools();
     let healthy = 0;
     for (const tool of list) {

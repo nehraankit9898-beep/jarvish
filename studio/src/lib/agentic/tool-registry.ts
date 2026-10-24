@@ -124,6 +124,62 @@ function auditCall(record: ToolCallRecord): void {
   }
 }
 
+// ---------- parameter validation ----------
+
+const TYPE_CHECKS: Record<string, (value: unknown) => boolean> = {
+  string: (v) => typeof v === 'string',
+  number: (v) => typeof v === 'number' && Number.isFinite(v),
+  boolean: (v) => typeof v === 'boolean',
+  array: (v) => Array.isArray(v),
+  object: (v) => typeof v === 'object' && v !== null && !Array.isArray(v),
+};
+
+/**
+ * Validate an invocation payload against the tool's DECLARED schema.
+ *
+ * H10: `invokeTool` used to hand `parameters` straight to the handler, so the
+ * `required` list and the per-parameter types the tools advertise (and that the
+ * LLM is billed to follow) were never enforced — a call with no arguments ran
+ * with `path === undefined`, `content === undefined`, etc. and the failure
+ * surfaced as an opaque ENOENT / "Empty path" instead of a schema error.
+ * Unknown extra keys are tolerated (handlers ignore what they do not declare).
+ * `taskId` is satisfied by the invocation itself, not by the payload.
+ */
+export function validateToolParameters(
+  def: ToolDefinition,
+  parameters: Record<string, any> | undefined,
+  invocationTaskId?: string
+): { ok: true } | { ok: false; error: string } {
+  const payload = parameters ?? {};
+  const problems: string[] = [];
+  for (const name of def.required ?? []) {
+    const value = payload[name];
+    const missing =
+      value === undefined ||
+      value === null ||
+      (typeof value === 'string' && value.trim() === '');
+    if (!missing) continue;
+    // `taskId` is supplied by the engine on the invocation, not by the caller
+    if (name === 'taskId' && invocationTaskId) continue;
+    // the declared description is the hint the model needs to fix the call
+    const hint = def.parameters?.[name]?.description;
+    problems.push(
+      `missing required parameter "${name}"${hint ? ` (${hint})` : ''}`
+    );
+  }
+  for (const [name, spec] of Object.entries(def.parameters ?? {})) {
+    const value = payload[name];
+    if (value === undefined || value === null) continue;
+    if (name === 'taskId' && !('taskId' in payload)) continue;
+    const check = TYPE_CHECKS[spec.type];
+    if (check && !check(value)) {
+      problems.push(`parameter "${name}" must be ${spec.type === 'object' || spec.type === 'array' ? 'an' : 'a'} ${spec.type}`);
+    }
+  }
+  if (problems.length) return { ok: false, error: `Invalid parameters: ${problems.join('; ')}` };
+  return { ok: true };
+}
+
 /**
  * Invoke a registered tool with permission enforcement, timeout, and redaction.
  *
@@ -169,6 +225,20 @@ export async function invokeTool(invocation: ToolInvocation): Promise<ToolResult
       error: `Tool ${invocation.tool} requires explicit approval`,
       permission: 'destructive',
       reason: 'User approval required for destructive tool',
+      at: new Date().toISOString(),
+    };
+    auditCall({ tool: invocation.tool, parameters: invocation.parameters, result, taskId: invocation.taskId, at: result.at });
+    return result;
+  }
+
+  // declared-schema validation (H10) — before the handler sees anything
+  const validation = validateToolParameters(def, invocation.parameters, invocation.taskId);
+  if (!validation.ok) {
+    const result: ToolResult = {
+      ok: false,
+      error: validation.error,
+      permission: def.permission,
+      reason: 'Parameter validation failed',
       at: new Date().toISOString(),
     };
     auditCall({ tool: invocation.tool, parameters: invocation.parameters, result, taskId: invocation.taskId, at: result.at });
@@ -507,26 +577,89 @@ export interface ToolHealthCheck {
 }
 
 /**
- * Run a health check on a tool by invoking it with minimal parameters.
+ * Check that a tool is wired up correctly.
  *
- * M4: `invokeTool` RETURNS a failed result (ok:false) instead of throwing
- * when the handler errors — treating "did not throw" as healthy made every
- * tool report ok:true, even broken ones. The result's own ok flag is the
- * health verdict.
+ * M4 kept the point: "the handler did not throw" is NOT a health signal,
+ * because `invokeTool` RETURNS `ok:false` results instead of throwing.
+ *
+ * H11 fixes what the M4 fix left behind: probing a tool means EXECUTING it, so
+ * the old "minimal parameters" call
+ *   • created a git repo and committed in the workspace (`git-init`,
+ *     `git-snapshot` are `review` tools that were run anyway),
+ *   • auto-approved every `destructive` tool (`approvedCommands: [toolName]`),
+ *     i.e. a status endpoint was allowed to delete files and roll the
+ *     workspace back, and
+ *   • reported every tool with a required parameter as BROKEN, because the
+ *     empty probe payload was rejected — a false alarm on a perfectly healthy
+ *     toolset, in the UI and on /api/system/status.
+ *
+ * A registry health check can honestly answer one question: is the tool
+ * registered, bound to a handler and does its own definition satisfy the
+ * schema? That is what it checks now. Pass `{ probe: true }` (only for tools
+ * that declare `permission: 'safe'` and need no payload) to additionally run
+ * the handler — the deep probe is opt-in precisely because it has effects.
  */
-export async function healthCheckTool(toolName: string, taskId: string): Promise<ToolHealthCheck> {
+export interface ToolHealthOptions {
+  /** actually invoke the handler (only for side-effect-free, safe tools) */
+  probe?: boolean;
+}
+
+const PROBE_EXCLUDED_TOOLS = new Set(['workspace-create', 'browser-session']);
+
+export async function healthCheckTool(
+  toolName: string,
+  taskId: string,
+  options: ToolHealthOptions = {}
+): Promise<ToolHealthCheck> {
+  const started = Date.now();
   const def = TOOL_REGISTRY.get(toolName);
   if (!def) {
     return { tool: toolName, ok: false, latencyMs: 0, error: 'Tool not registered' };
   }
-  const started = Date.now();
-  try {
-    const result = await invokeTool({
+  if (!TOOL_HANDLERS.get(toolName)) {
+    return { tool: toolName, ok: false, latencyMs: 0, error: 'Tool has no handler' };
+  }
+  const parsed = ToolDefinitionSchema.safeParse(def);
+  if (!parsed.success) {
+    return {
       tool: toolName,
-      parameters: {},
-      taskId,
-      approvedCommands: def.permission === 'destructive' ? [toolName] : [],
-    });
+      ok: false,
+      latencyMs: Date.now() - started,
+      error: `Tool definition invalid: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`,
+    };
+  }
+
+  if (!options.probe) {
+    return { tool: toolName, ok: true, latencyMs: Date.now() - started };
+  }
+  // H37: a few tools are labelled 'safe' (nobody has to approve them) yet are
+  // NOT harmless to call casually — they allocate a live resource or create
+  // directories on disk. A health probe must never leave an orphaned browser
+  // session (with a DB row, an audit entry and an open Playwright context) or
+  // a stray workspace behind, so these stay structural-only even in probe mode.
+  if (PROBE_EXCLUDED_TOOLS.has(toolName)) {
+    return {
+      tool: toolName,
+      ok: true,
+      latencyMs: Date.now() - started,
+      error: 'not probed: tool allocates a live resource',
+    };
+  }
+  // a probe is only allowed for read-only tools with no required input
+  const needsPayload = (def.required ?? []).filter((name) => name !== 'taskId');
+  if (def.permission !== 'safe' || needsPayload.length) {
+    return {
+      tool: toolName,
+      ok: true,
+      latencyMs: Date.now() - started,
+      error:
+        def.permission !== 'safe'
+          ? 'not probed: tool can mutate state'
+          : 'not probed: tool needs parameters',
+    };
+  }
+  try {
+    const result = await invokeTool({ tool: toolName, parameters: {}, taskId });
     return {
       tool: toolName,
       ok: result.ok === true,
@@ -534,15 +667,23 @@ export async function healthCheckTool(toolName: string, taskId: string): Promise
       ...(result.ok === true ? {} : { error: result.error || 'tool returned ok:false' }),
     };
   } catch (err) {
-    return { tool: toolName, ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : 'Unknown error' };
+    return {
+      tool: toolName,
+      ok: false,
+      latencyMs: Date.now() - started,
+      error: err instanceof Error ? err.message : 'Unknown error',
+    };
   }
 }
 
 /**
  * Run health checks on all registered tools.
  */
-export async function healthCheckAllTools(taskId: string): Promise<ToolHealthCheck[]> {
+export async function healthCheckAllTools(
+  taskId: string,
+  options: ToolHealthOptions = {}
+): Promise<ToolHealthCheck[]> {
   const tools = listTools();
-  const results = await Promise.all(tools.map((t) => healthCheckTool(t.name, taskId)));
+  const results = await Promise.all(tools.map((t) => healthCheckTool(t.name, taskId, options)));
   return results;
 }

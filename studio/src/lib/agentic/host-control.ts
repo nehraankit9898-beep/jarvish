@@ -30,7 +30,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { checkCommand, type Permission } from './permissions';
-import { normalizeCommand } from './terminal';
 import { protect } from './secrets';
 import { validateEmail, type MeetingInvite } from './email-connector';
 import { assertNotKilled, desktopMode, isKilled } from './safety';
@@ -306,8 +305,15 @@ export function classifyHostAction(action: HostAction): HostClassification {
     }
 
     case 'exec': {
-      const command = normalizeCommand(String(action.command ?? ''));
-      if (!command) return { permission: 'forbidden', reason: 'empty command', paths: [] };
+      const rawCommand = String(action.command ?? '').trim();
+      if (!rawCommand) return { permission: 'forbidden', reason: 'empty command', paths: [] };
+      // H15: `normalizeCommand` folds newlines into spaces. Classifying the
+      // NORMALIZED string hid the multi-line structure from the classifier AND
+      // from the metacharacter escalation below — so `echo hi\nrm -rf ./x`
+      // looked like one harmless `echo` while /bin/bash -c ran BOTH lines. The
+      // raw payload is what must be judged; whitespace folding is only for
+      // display and approval matching.
+      const command = rawCommand;
       const cwd = canonical(action.cwd ?? os.homedir());
       if (action.cwd && isSensitivePath(action.cwd)) {
         return { permission: 'forbidden', reason: 'working directory is a protected location', paths: [cwd] };

@@ -112,7 +112,12 @@ export async function recordAudit(input: AuditInput): Promise<void> {
         approval: (input.approval ?? '').slice(0, 20),
         result: input.result ?? 'ok',
         errorCategory: (input.errorCategory ?? '').slice(0, 60),
-        artifact: input.artifact ? JSON.stringify(input.artifact).slice(0, 4000) : '',
+        // H20: `details` are secret-masked, `artifact` was not — and an
+        // artifact is exactly where a caller dumps "the thing I touched" (a
+        // tool payload, a provider row, a request body). Mask it the same way.
+        artifact: input.artifact
+          ? protect(JSON.stringify(input.artifact)).masked.slice(0, 4000)
+          : '',
         details: redactDetails(input.details),
         ip: (input.ip ?? '').slice(0, 64),
       },

@@ -159,7 +159,12 @@ export async function ensureBridge(): Promise<BridgeProc | null> {
         child = spawn(python, [
           bridgeScript(),
           '--port', String(desktopPort()),
-          '--token', desktopToken(),
+          // H33: the token is deliberately NOT passed on the command line any
+          // more — argv of a running process is world-readable (`ps -ef`,
+          // /proc/<pid>/cmdline), so every local user could read the bridge
+          // token and drive the mouse and keyboard. bridgeEnv() already hands it
+          // over in AGENTSCOPE_DESKTOP_TOKEN, which only the owner can read, and
+          // both bridges default --token from exactly that variable.
           '--kill-flag', killFlagFile(),
         ], { env: bridgeEnv(), shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
       } catch (e) {
@@ -337,9 +342,9 @@ export async function desktopCall(endpoint: string, payload: Record<string, unkn
   }
 
   const url = `http://127.0.0.1:${desktopPort()}/${endpoint}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), endpointTimeoutMs(endpoint));
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), endpointTimeoutMs(endpoint));
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -349,7 +354,6 @@ export async function desktopCall(endpoint: string, payload: Record<string, unkn
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-    clearTimeout(timeout);
 
     if (endpoint === 'screenshot' && res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
@@ -367,5 +371,11 @@ export async function desktopCall(endpoint: string, payload: Record<string, unkn
   } catch (err) {
     const message = err instanceof Error ? err.message : 'bridge call failed';
     return { ok: false, error: `Desktop bridge unreachable: ${message}` };
+  } finally {
+    // H34: the timeout is cancelled only once the WHOLE exchange is over.
+    // It used to be cancelled right after the response arrived, so a bridge
+    // that answered and then stalled mid-body (a screenshot stream that never
+    // ends) left this promise — and the task awaiting it — hanging forever.
+    clearTimeout(timeout);
   }
 }

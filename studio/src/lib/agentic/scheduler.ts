@@ -46,7 +46,9 @@ export function blockingDependencies(step: PlanStep): number[] {
   return step.dependencies
     .filter((d) => d.type === 'blocks')
     .map((d) => d.stepIndex)
-    .filter((n) => Number.isFinite(n) && n > 0);
+    // a step can never wait for ITSELF — that is a no-op edge, not a real
+    // dependency (and treating it as one would flag a "cycle" and skip it)
+    .filter((n) => Number.isFinite(n) && n > 0 && n !== step.index);
 }
 
 /** Dependencies explicitly declared as parallel-safe. */
@@ -108,11 +110,22 @@ export interface DependencyStatus {
 
 export function checkDependencies(
   step: PlanStep,
-  statuses: Map<number, SchedulerStepStatus>
+  statuses: Map<number, SchedulerStepStatus>,
+  /**
+   * The step indexes that actually exist in this plan. A dependency that
+   * points at anything else (a step the planner never produced, or one that
+   * was dropped when the plan was truncated to `maxSteps`) can NEVER reach a
+   * done status — without this set the dependent step would be parked behind
+   * it forever and silently skipped. Pass the plan's indexes to have such
+   * dangling references ignored instead.
+   */
+  knownIndexes?: Set<number>
 ): DependencyStatus {
   const pending: number[] = [];
   const broken: number[] = [];
   for (const dep of blockingDependencies(step)) {
+    // dangling reference → ignore it (the step it points at does not exist)
+    if (knownIndexes && !knownIndexes.has(dep)) continue;
     const status = statuses.get(dep);
     if (status && DONE_STATUSES.includes(status)) continue;
     if (status === 'failed' || status === 'denied') broken.push(dep);
@@ -125,15 +138,46 @@ export function checkDependencies(
   };
 }
 
+/** The set of step indexes a plan actually contains. */
+export function planIndexes(steps: PlanStep[]): Set<number> {
+  return new Set(steps.map((s) => s.index));
+}
+
+/**
+ * Drop dependency edges that point at a step which is not part of (this) plan
+ * — and self edges. The planner validates its references against its OWN step
+ * count, but the caller may still truncate the plan afterwards (maxSteps),
+ * which would leave references to dropped steps behind. A dangling reference
+ * parks the dependent step behind something that can never complete, so the
+ * step is silently skipped and the task still reports done.
+ *
+ * Mutates and returns the same list.
+ */
+export function sanitizeStepDependencies(steps: PlanStep[]): PlanStep[] {
+  const known = planIndexes(steps);
+  for (const step of steps) {
+    const deps = step.dependencies;
+    if (!deps?.length) continue;
+    const kept = deps.filter(
+      (d) => d.stepIndex !== step.index && known.has(d.stepIndex)
+    );
+    if (kept.length !== deps.length) step.dependencies = kept;
+  }
+  return steps;
+}
+
 /** Steps whose dependencies are satisfied and that can start now. */
 export function readySteps(
   steps: PlanStep[],
   statuses: Map<number, SchedulerStepStatus>
 ): PlanStep[] {
+  // the plan itself defines which indexes exist: a dependency on anything
+  // else is dangling and must not park the step forever
+  const known = planIndexes(steps);
   return steps.filter((step) => {
     const status = statuses.get(step.index);
     if (status && status !== 'pending') return false;
-    return checkDependencies(step, statuses).satisfied;
+    return checkDependencies(step, statuses, known).satisfied;
   });
 }
 

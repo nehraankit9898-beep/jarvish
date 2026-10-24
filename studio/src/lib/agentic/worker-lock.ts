@@ -49,7 +49,13 @@ function readLock(file = workerLockPath()): LockBody | null {
 export function isWorkerAlive(now = Date.now(), file = workerLockPath()): boolean {
   const lock = readLock(file);
   if (!lock) return false;
-  if (now - Date.parse(lock.heartbeatAt) > STALE_MS) return false;
+  // H12: an unparseable timestamp used to compare as `NaN > STALE_MS` = false,
+  // i.e. "fresh" — a lock file with a corrupt heartbeat then depended on the
+  // pid check alone, and a recycled pid could keep the whole background
+  // runtime locked out forever. No usable heartbeat means the lock is stale.
+  const beat = Date.parse(lock.heartbeatAt);
+  if (!Number.isFinite(beat)) return false;
+  if (now - beat > STALE_MS) return false;
   return pidAlive(lock.pid);
 }
 

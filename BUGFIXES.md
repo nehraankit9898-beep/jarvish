@@ -106,3 +106,118 @@ DATABASE_URL="file:../db/custom.db" bun test   # 402 pass / 0 fail
 ```
 
 The dedicated before/after regression checks (classifier escalation matrix, DST cron scans, goal-decomposition edge cases) are in `scripts/verify-fixes.ts` of the delivery bundle; the full unified diff is in `scripts/fixes.diff`.
+
+---
+
+# Round 2 — second audit pass (2026-10)
+
+Same method, applied again over the whole `studio/src/lib/agentic/**` tree plus the
+API routes: read the code, reproduce the failure, fix, add a regression test, then
+re-verify with `tsc` + `bun test`. 30 fixes, one finding investigated and
+confirmed NOT a bug (H27), and four audit notes; everything was reproduced
+against the code before it was touched. Tags `H5 … H37` continue the numbering above and are
+written into the source as `// H<n>:` comments.
+
+## 🔴 Critical / high-impact
+
+| # | Where | Bug |
+|---|-------|-----|
+| H8 | `custom-tools.ts` | The custom-tool "sandbox" was escapable: the scan only blocked `eval(` and `new Function`, so `Function("return process")()` and the `""["constructor"]["constructor"]` chain (built from string pieces — invisible to any source scan) walked straight out to the host realm, with `require`, `process.env` and raw `fetch` in reach. Tool bodies now run in a dedicated `vm` context (`codeGeneration` off, an explicit global whitelist, capped timers, hard 30 s timeout), the validator compiles the script exactly like the runner does, and `FORBIDDEN_CODE_PATTERNS` covers realm hops, prototype access, `Buffer`, `document`/`window` and raw `fetch`. |
+| H11 | `tool-registry.ts`, `/api/tools/health` | A "health check" EXECUTED the tools: it git-`init`'d and committed in real task workspaces, ran `file-delete`/`git-rollback` because it passed `approvedCommands: [toolName]` (auto-approving every destructive tool from a GET endpoint), and reported every tool with a required parameter as BROKEN because its empty probe payload was rejected. Structural by default (registered + handler + definition satisfies the schema); `{ probe: true }` (`?probe=1`) is the explicit opt-in and only for `safe` tools that need no payload. |
+| H13 | `outbound.ts` | The SSRF guard treated *any* IP literal as a loopback host (`net.isIP(host) !== 0`), which with `allowLoopback` also switched off the https requirement — `http://203.0.113.9` was accepted as a "loopback" endpoint. Meanwhile real loopback spellings it should have caught were missed: `0:0:0:0:0:0:0:1`, `::ffff:127.0.0.1`, `::127.0.0.1`, 6to4-wrapped v4. IPv6 is now expanded to its 8 groups and the embedded-IPv4 forms go through the v4 rules. |
+| H7 | `terminal.ts` | `executeCommand` classified the *whitespace-folded* command. `normalizeCommand` turns `\n` into a space, so `echo hi\nrm -rf ./build` read as one harmless `echo` to the classifier, the audit trail and the approval key — while `/bin/bash -c` ran both lines. Classification and the metacharacter check now see the raw payload; the folded form is only the approval-matching key. |
+| H15 | `host-control.ts` | Same root cause in `classifyHostAction` for `exec`: the newline escalation from C1 was dead there, so under `AGENTSCOPE_HOST_MODE=trusted` a multi-line payload auto-ran. (Its `normalizeCommand` import is gone entirely.) |
+| H5 | `scheduler.ts`, `orchestrator.ts` | A plan step whose `dependencies` referenced a step the final (truncated / re-planned) plan did not contain was **never ready and never failed** — the task just stopped. Added `planIndexes()` + `sanitizeStepDependencies()`, applied at every plan-creation site (`bounded`, `revisedBounded`, `planSteps`) and made `checkDependencies`/`readySteps` ignore edges to non-existent steps. |
+| H35/H36 | `/api/tools/health`, `/api/system/status`, `/api/tools/invoke` | The registry is filled lazily per family, and the routes disagreed about it: `list` registered 9 families, `invoke` only 6 (`memory-*`, `conversation-recall`, `gmail-*`, `whatsapp-send` … returned "Unknown tool" although they were listed), and `health`/`status` registered none — an empty toolset, or a random subset depending on which request ran first. New `tool-catalog.ts` exports `ensureFullToolCatalog()` and every entry point calls it. |
+| H24/H25 | `documents.ts` | Two ways to take the server down with one document: an xlsx cell ref (`r="AAAAAAAA1"`) padded the row with ~8 billion empty cells, and the PDF `TJ` array regex had two branches that both match a backslash — a stream of backslashes with no `]` was exponential. Column refs outside the real 16 384-column grid are dropped; the regex branches are now disjoint. |
+| H17/H34 | `downloads.ts`, `*-bridge.ts` | Timeouts that stopped when the *headers* arrived: a server (or the local Python bridge) that trickles a body forever kept the request — and the agent task waiting on it — alive indefinitely, past any size cap. The timer is now re-armed per chunk (a real stall timeout) and cleared in a `finally`. |
+| H31 | `orchestrator.ts` | `filesChanged` was persisted from the snapshot the step had when it was *loaded*, so every fix attempt overwrote the list and the files written by earlier attempts vanished from the step record, the diff view and the Coder→Tester hand-off. Now an accumulator, updated and persisted per attempt. |
+| H21/H26 | `knowledge.ts`, `project-index.ts` | Deleting a document (or "Clear index", or re-indexing a file that became empty) removed the `KnowledgeDoc` row and left its `KnowledgeChunk` rows — the document's actual text — in SQLite forever, relying on an FK cascade that only fires when the connection has `PRAGMA foreign_keys = ON`. Chunks are now deleted explicitly. |
+| H6 | `automation.ts` | M5's in-process claim was released in `finally` *unconditionally*, so a skipped duplicate run dropped the claim of the starter still in flight; the next tick saw an unclaimed schedule with no run row yet and started a second, concurrent run. Only the caller that took the claim releases it. |
+| H10 | `tool-registry.ts` | `invokeTool` never validated against the declared schema: `file-read` reached `fs.readFile` with `path: 123` (ENOENT, "forbidden"-looking errors, no useful message) and missing required parameters were handled by whichever `params.x` line happened to crash. `validateToolParameters()` now checks required-ness and the declared types (with the parameter's own description in the message) and records its own audit entry. |
+| H19 | `provider-connection.ts` | "Test connection"/"list models" allowed loopback for `ollama` **only**, while the code that actually calls models applies no outbound guard — so LM Studio / vLLM on `http://localhost:1234/v1` worked for chat but was reported broken with "resolves to a loopback address". Loopback is now allowed for any user-configured provider (private ranges, link-local and metadata still blocked) and can be closed with `AGENTSCOPE_PROVIDER_ALLOW_LOOPBACK=0`. |
+| H33 | `desktop-bridge.ts`, `voice-bridge.ts` | The bridge token was handed to the child via `--token <secret>`, and process argv is world-readable (`ps -ef`, `/proc/<pid>/cmdline`) — any local user could read the key to the mouse, keyboard and screen. It travels in `AGENTSCOPE_DESKTOP_TOKEN` only, which both bridge scripts already default `--token` from. |
+
+## 🟡 Medium
+
+| # | Where | Bug |
+|---|-------|-----|
+| H9 | `custom-tools.ts` | `deleteCustomTool` deleted the row but left the tool registered — a deleted tool stayed invocable until the next restart. Now `unregisterTool()` + the live custom-tool set. |
+| H12 | `worker-lock.ts` | A lock file whose `heartbeatAt` failed to parse produced `NaN` comparisons — the dead worker looked permanently fresh, so the singleton runtime never took over. A non-finite heartbeat is stale. |
+| H14 | `custom-tools.ts` | The scan rejected code it could not compile-check; validation now parses the script through the same `vm.Script` the runner uses, so "saved OK / failed at run time" is gone. |
+| H16 | `browser/browser-service.ts` | Navigation applied the provider policy, including `requireHttps`, so the browser refused the plain-`http://` links it advertised as allowed. The address rules still apply (private/link-local/metadata blocked, loopback still opt-in). |
+| H18 | `downloads.ts` | The watcher's startup pass, commented "seed the known-set without notifying", notified anyway: any file touched in the last 10 minutes produced a phantom "New file in Downloads" on *every* restart. The seed scan is silent now. |
+| H20 | `audit.ts` | `details` were secret-masked, `artifact` was not — and the artifact is where callers dump what they touched (tool payloads, request bodies). Masked the same way. |
+| H22/H23 | `documents.ts` | A zip whose local header lies about `nameLen`/`extraLen` sliced past EOF and `subarray` clamped silently → garbage treated as document text; and one `&#99999999;` aborted the whole extraction with a raw `RangeError` from `String.fromCodePoint`. Out-of-range/`surrogate` references are left literal. |
+| H28 | `provider-store.ts` | M2 preserved `model`/`baseUrl` when a field was absent, but `costClass` was re-inferred on every partial save — so reordering priorities or renaming a provider silently discarded the user's explicit free/paid classification and quietly changed free-only routing. |
+| H29 | `provider-store.ts` | `costClassOf` returned the provider-level class first, so an OpenRouter-style `…:free` model on a paid provider was "paid": free-only mode rejected exactly the free models it existed to use (`no_model_available`), and "prefer free" never moved them up. The per-model marker now wins. |
+| H37 | `tool-registry.ts` | Even in opt-in probe mode, `workspace-create` and `browser-session` were executed — a status endpoint that creates directories and leaves an orphaned live Playwright session (plus DB row and audit entry) behind per call. They are structural-only. |
+| H27 (not a bug) | `model-router.ts` | Fallback targets deliberately get `maxRetries ?? 0` while the role primary gets the default — asserted by `tests/model-router.test.ts` ("3 attempts on the primary + 1 on the fallback"). Left alone. |
+
+## ⚪ Notes from the audit (no code change)
+
+* `WorkspaceLock` hand-off (`scheduler.ts`) compares holder strings, so a stale
+  release can drop a new writer's lock; orchestrator holders are unique per step
+  (`step-<index>`), so it is not reachable today.
+* A screen task records `history.push(describeAction(action))` after an approval
+  without checking the executed action's result — the trail can claim an action
+  that the bridge then failed. Cosmetic, but worth knowing.
+* `recordAudit` takes the client IP from `x-forwarded-for`, which is spoofable;
+  fine for a local-first app, wrong for a multi-tenant one.
+* `neutralizeInjection`/`asUntrustedReference`, `allowed-roots` symlink descent
+  (Dirents for symlinked dirs are not `isDirectory()`, so the tree walker never
+  follows links), `permissions.ts`, `cron.ts`, `memory.ts`, `roles.ts`,
+  `approvals.ts`, `secrets.ts`, `crypto.ts`, `remote-session.ts`, `git-tools.ts`,
+  `audit.ts` redaction, `host-control` approval queue/kill-switch ordering and
+  `message-bus` visibility rules were re-read and are sound.
+
+## Files changed (round 2)
+
+```
+studio/src/lib/agentic/scheduler.ts          (H5)
+studio/src/lib/agentic/orchestrator.ts       (H5, H31)
+studio/src/lib/agentic/automation.ts         (H6)
+studio/src/lib/agentic/terminal.ts           (H7)
+studio/src/lib/agentic/host-control.ts       (H15)
+studio/src/lib/agentic/custom-tools.ts       (H8, H9, H14)
+studio/src/lib/agentic/tool-registry.ts      (H10, H11, H37)
+studio/src/lib/agentic/outbound.ts           (H13)
+studio/src/lib/agentic/worker-lock.ts        (H12)
+studio/src/lib/agentic/downloads.ts          (H17, H18)
+studio/src/lib/agentic/documents.ts          (H22, H23, H24, H25)
+studio/src/lib/agentic/knowledge.ts          (H21)
+studio/src/lib/agentic/project-index.ts      (H26)
+studio/src/lib/agentic/provider-store.ts     (H28, H29)
+studio/src/lib/agentic/provider-connection.ts(H19)
+studio/src/lib/agentic/audit.ts              (H20)
+studio/src/lib/agentic/desktop-bridge.ts     (H33, H34)
+studio/src/lib/agentic/voice-bridge.ts       (H33, H34)
+studio/src/lib/agentic/browser/browser-service.ts (H16)
+studio/src/lib/agentic/tool-catalog.ts       (NEW — H35/H36)
+studio/src/app/api/tools/route.ts            (H35)
+studio/src/app/api/tools/health/route.ts     (H11, H35)
+studio/src/app/api/tools/invoke/route.ts     (H36)
+studio/src/app/api/system/status/route.ts    (H11, H35)
+studio/src/app/api/laptop/route.ts           (H35)
+studio/tests/bug-hunt.test.ts               (NEW — 22 regression tests)
+studio/tests/bug-hunt-2.test.ts             (NEW — 19 regression tests)
+```
+
+## How to verify (round 2)
+
+```bash
+cd studio
+bun install
+npx tsc --noEmit      # 0 errors
+bun test              # 703 pass / 0 fail (40 files)
+bun test tests/bug-hunt.test.ts tests/bug-hunt-2.test.ts   # the 41 new checks
+```
+
+Every new test was also run against the *unpatched* code where the failure was
+mechanical (H5, H6, H8, H10, H11, H13, H21/H26, H22–H25, H37 reproduce the old
+behaviour and fail; the fix makes them pass), so they pin the bug, not the patch.
+
+Known flake, pre-existing and unrelated to these changes:
+`new-features.test.ts > notifications > … prune` occasionally fails on a
+same-millisecond `createdAt` tie when the whole suite shares one in-memory `db`
+across files. It passes when the file runs alone and in repeated full runs.

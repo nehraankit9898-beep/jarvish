@@ -32,7 +32,30 @@ export interface ConnectionTestResult {
 }
 
 /** Providers that are meant to run on the developer's own machine. */
-const LOCAL_PROVIDERS = new Set(['ollama']);
+const LOCAL_PROVIDERS = new Set(['ollama', 'lmstudio']);
+
+/**
+ * H19: loopback used to be allowed for OLLAMA ONLY, while the code that
+ * actually issues LLM calls (src/lib/llm-core) applies no outbound guard at
+ * all. A user running LM Studio / vLLM / LiteLLM on http://localhost:1234/v1
+ * therefore had a provider that WORKED but was reported BROKEN ("Base URL
+ * resolves to a loopback address"), with an empty model list — a diagnostic
+ * that contradicts the runtime. The guard protects a CLASS of address, not a
+ * product name, so loopback is allowed for any user-configured provider;
+ * a hardened deployment can close it again with
+ * AGENTSCOPE_PROVIDER_ALLOW_LOOPBACK=0. Private ranges, link-local and the
+ * cloud metadata endpoints stay blocked in both cases.
+ */
+export function providerLoopbackAllowed(): boolean {
+  return process.env.AGENTSCOPE_PROVIDER_ALLOW_LOOPBACK !== '0';
+}
+
+function outboundPolicy(providerId: string) {
+  return {
+    allowLoopback: LOCAL_PROVIDERS.has(providerId) || providerLoopbackAllowed(),
+    allowPrivateNetwork: false,
+  };
+}
 
 function baseUrlFor(providerId: string, provided?: string): string {
   const info = getProvider(providerId);
@@ -109,10 +132,7 @@ export async function testProviderConnection(
     if (!baseUrl) {
       return { ok: false, error: 'Base URL is required', errorCategory: 'config' };
     }
-    const url = await assertOutboundUrl(baseUrl, {
-      allowLoopback: LOCAL_PROVIDERS.has(providerId),
-      allowPrivateNetwork: false,
-    });
+    const url = await assertOutboundUrl(baseUrl, outboundPolicy(providerId));
     const apiKey = input.apiKey?.trim() ?? '';
     const base = url.toString().replace(/\/+$/, '');
 
@@ -240,9 +260,7 @@ export async function listProviderModels(
   const timeoutMs = Math.min(60_000, Math.max(5_000, input.timeoutMs ?? 20_000));
 
   try {
-    const url = await assertOutboundUrl(baseUrl, {
-      allowLoopback: LOCAL_PROVIDERS.has(providerId),
-    });
+    const url = await assertOutboundUrl(baseUrl, outboundPolicy(providerId));
     const base = url.toString().replace(/\/+$/, '');
     const apiKey = input.apiKey?.trim() ?? '';
 
