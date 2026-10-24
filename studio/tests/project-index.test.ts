@@ -178,7 +178,11 @@ describe('project index', () => {
       await resetProjectIndex(big).catch(() => undefined);
       await fs.rm(big, { recursive: true, force: true }).catch(() => undefined);
     }
-  });
+    // This fixture writes ~80 MB and indexes it: a genuinely heavy I/O test.
+    // The default 5 s per-test budget is not enough on a slow laptop / CI box,
+    // which made `bun test` red for a reason that has nothing to do with the
+    // indexer.
+  }, 120_000);
 });
 
 describe('project symbol index', () => {

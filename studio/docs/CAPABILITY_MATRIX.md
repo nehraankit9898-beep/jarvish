@@ -22,7 +22,8 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | App / window close | 🆕 | `desktop-close-window` (kai match ho to refuse) |
 | Window minimize/maximize/restore | 🆕 | `desktop-window-state` |
 | File list/read/write/delete (recycle bin) | ✅ | `file-*`, `host-tree`, host trash |
-| File search / rename / move | 🟡 | `exec` (`mv`, `find`) approval ke saath; dedicated search tool nahi |
+| File search (naam + content) | ✅ | `file-search` (line number + preview, read-only) |
+| File rename / move | 🟡 | `exec` (`mv`) approval ke saath |
 | Volume | ✅ | `desktop-volume` |
 | Brightness | 🆕 | `desktop-brightness` (5–100, Windows panel) |
 | WiFi on/off + status | 🆕 | `desktop-wifi-set` (Administrator chahiye), `desktop-wifi-status` |
@@ -41,14 +42,15 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Website open / navigate / read page / click / fill | ✅ | `browser-*` (payment guard ke saath) |
 | Downloads manage | ✅ | `download-file`, `downloads-digest/cleanup` |
 | Google search, YouTube search | 🟡 | browser se search URL khol ke; dedicated search tool nahi |
-| News / weather | ❌ | koi tool nahi (browser se ho sakta hai) |
+| Weather | ✅ | `weather-now` (Open-Meteo, key ki zaroorat nahi) |
+| News / headlines | ✅ | `news-headlines` (public RSS, topic-wise) |
 
 ## Data & Research
 | Feature | Status | Note |
 |---|---|---|
 | Text / code docs summarize | ✅ | knowledge base |
-| PDF / DOCX / XLSX padhna | ❌ | `knowledge.ts` inhe `unsupported` mark karta hai |
-| OCR | ❌ | |
+| PDF / DOCX / XLSX / PPTX / ODT / RTF / EPUB padhna | ✅ | `documents.ts` (koi naya dependency nahi) + `document-read` tool + knowledge base import |
+| OCR (scanned PDF / photo ka text) | ❌ | `document-read` scan detect kar ke saaf bata deta hai ki OCR chahiye; OCR engine nahi hai |
 | Charts banana | ❌ | UI me recharts hai, agent tool nahi |
 
 ## Scheduling

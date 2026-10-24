@@ -867,9 +867,16 @@ export function useWakeWord(opts: {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const onWakeRef = useRef(onWake);
-  onWakeRef.current = onWake;
   const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  // Refs are synced in an effect, never during render: writing a ref while
+  // rendering is exactly the "cannot access refs during render" anti-pattern
+  // (and it breaks with React's concurrent rendering).
+  useEffect(() => {
+    onWakeRef.current = onWake;
+  }, [onWake]);
+  useEffect(() => {
+    pausedRef.current = paused;
+  }, [paused]);
 
   // start / stop the engine when the user flips Hands-free
   useEffect(() => {

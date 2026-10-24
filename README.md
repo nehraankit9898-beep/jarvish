@@ -200,6 +200,24 @@ Bridge sirf **127.0.0.1** pe bind hota hai, token (`db/.desktop-token`) ke bina 
 Poora troubleshooting table: [`studio/docs/WINDOWS_SETUP.md`](studio/docs/WINDOWS_SETUP.md) §7.
 
 
+## Documents, file search, weather & news (latest session)
+
+Studio ab wo cheezein bhi kar sakta hai jo pehle **missing** thi (`docs/CAPABILITY_MATRIX.md` me ✅ ho gayi hain):
+
+| Kya | Kaise | Note |
+|---|---|---|
+| PDF / Word / Excel / PowerPoint / OpenDocument / RTF / EPUB **padhna** | `document-read` tool + knowledge base import | `src/lib/agentic/documents.ts` — **koi naya npm dependency nahi** (apna zip + pdf-stream parser) |
+| Scanned PDF | detect hota hai aur saaf bolta hai ki OCR chahiye | OCR engine jaan-boojh kar nahi add kiya (bhaari dependency) |
+| File dhoondhna — naam se **ya** file ke andar ke text se | `file-search` tool | line number + preview, read-only, `node_modules`/`.git` skip |
+| Mausam | `weather-now` tool | Open-Meteo, **API key nahi** chahiye |
+| News / headlines | `news-headlines` tool | public RSS (Google News), topic-wise |
+
+Naye tools `/api/tools` aur `/api/tools/invoke` me register hain, permission `safe` hai
+(kuch delete/write nahi karte), aur har path workspace ya allowed-roots guard se guzarta hai.
+
+Teen naye test files: `tests/documents.test.ts`, `tests/document-tools.test.ts`,
+`tests/info-tools.test.ts` — sab offline chalte hain (koi network/credential nahi).
+
 ## Bug-fix update — 8 real bugs fixed (latest session)
 
 Poore project ka systematic bug audit: 2 HIGH (unsatisfiable-cron runaway cost loop, cancelled-task ka pending host-approval execute hona), 4 MEDIUM (silent morning-summary TTS, double morning summary non-UTC timezones me, vision null-coordinate click, tab-close par server-side mic leak), 2 LOW (Google OAuth login-CSRF, env-var NaN). Har fix ka regression test `tests/bugfix-regressions.test.ts` me — ab **773/773 tests pass**.

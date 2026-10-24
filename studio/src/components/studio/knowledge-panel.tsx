@@ -313,8 +313,9 @@ export function KnowledgePanel() {
               Index document
             </Button>
             <p className="text-[11px] text-zinc-500 mt-2">
-              Binary formats (pdf, docx, images) are not supported and are reported as
-              &ldquo;unsupported&rdquo; instead of pretending to be indexed.
+              Supported: text/source files and real documents (pdf, docx, xlsx, pptx,
+              odt/ods, rtf, epub). Images, archives and scanned PDFs are reported as
+              &ldquo;unsupported&rdquo; with the exact reason instead of pretending to be indexed.
             </p>
           </section>
 
