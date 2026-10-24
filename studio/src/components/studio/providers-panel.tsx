@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -166,6 +166,7 @@ export function ProvidersPanel() {
   const [modelMeta, setModelMeta] = useState<ModelListMeta | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const discoveryRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -320,8 +321,11 @@ export function ProvidersPanel() {
     }
   }, [current, apiKey, baseUrl, model, load]);
 
-  const loadModels = useCallback(async () => {
+  const loadModels = useCallback(async (silent = false) => {
     if (!current) return;
+    discoveryRef.current?.abort();
+    const controller = new AbortController();
+    discoveryRef.current = controller;
     setModelsLoading(true);
     try {
       // POST: an UNSAVED key must not travel in a URL (it would land in
@@ -329,6 +333,7 @@ export function ProvidersPanel() {
       // body has no key, so Refresh works without retyping.
       const res = await fetch(`/api/providers/${current.provider}/models`, {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           refresh: true,
@@ -339,6 +344,7 @@ export function ProvidersPanel() {
         }),
       });
       const data = await res.json();
+      if (controller.signal.aborted) return;
       if (!res.ok) throw new Error(data.error || 'Could not list models');
       setModels(data.models ?? []);
       setModelMeta({
@@ -350,7 +356,7 @@ export function ProvidersPanel() {
         selected: data.selected,
         selectedNotice: data.selectedNotice,
       });
-      toast({
+      if (!silent) toast({
         title:
           data.source === 'provider'
             ? 'Live models from the provider'
@@ -363,15 +369,33 @@ export function ProvidersPanel() {
         variant: data.source === 'catalog' ? 'destructive' : undefined,
       });
     } catch (err) {
-      toast({
+      if (controller.signal.aborted) return;
+      setModels([]);
+      setModelMeta({ source: 'catalog', cached: false, fetchedAt: null, error: err instanceof Error ? err.message : 'Discovery failed' });
+      if (!silent) toast({
         title: 'Could not list models',
         description: err instanceof Error ? err.message : 'Unknown error',
         variant: 'destructive',
       });
     } finally {
-      setModelsLoading(false);
+      if (!controller.signal.aborted) setModelsLoading(false);
     }
   }, [current, apiKey, baseUrl, model]);
+
+  useEffect(() => {
+    discoveryRef.current?.abort();
+    if (!current) return;
+    setModels([]);
+    setModelMeta(null);
+    const timer = setTimeout(() => void loadModels(true), 650);
+    return () => {
+      clearTimeout(timer);
+      discoveryRef.current?.abort();
+    };
+    // Identity edits, not model changes or catalogue responses, trigger discovery.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current?.provider, apiKey, baseUrl]);
+
 
   const remove = useCallback(async () => {
     if (!current) return;

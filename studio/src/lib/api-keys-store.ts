@@ -5,7 +5,7 @@ import { getProvider, resolveModel, type ProviderId } from '@/lib/providers';
 
 export interface ConnectionConfig {
   /**
-   * Only set when a key still lives in this browser (legacy value). New keys
+   * Only set for a session-only/legacy key in tab memory. New keys
    * are stored ENCRYPTED on the server and the browser keeps `keyHint` only —
    * see settings-dialog.tsx.
    */
@@ -28,6 +28,23 @@ export type ConnectionsMap = Partial<Record<ProviderId, ConnectionConfig>>;
 
 const STORAGE_KEY = 'agentscope-studio-connections';
 const ACTIVE_KEY = 'agentscope-studio-active-provider';
+// Unsaved/legacy secrets may live in this tab, never in durable browser storage.
+const sessionKeys = new Map<ProviderId, string>();
+const keyIdentities = new Map<string, string>();
+
+export function persistableConnections(map: ConnectionsMap): ConnectionsMap {
+  return Object.fromEntries(Object.entries(map).map(([id, config]) => {
+    if (!config) return [id, config];
+    const hasSessionKey = Boolean(config.apiKey);
+    return [id, {
+      ...config,
+      apiKey: '',
+      // An old signature actually contained the entire raw API key.
+      testedSign: hasSessionKey || config.testedSign?.includes('raw:') ? undefined : config.testedSign,
+      connected: hasSessionKey ? false : config.connected,
+    }];
+  })) as ConnectionsMap;
+}
 
 /**
  * Substitutions made while loading stored settings. A retired model id is
@@ -57,6 +74,20 @@ export function loadConnections(): ConnectionsMap {
     const map: ConnectionsMap = raw
       ? { ...DEFAULTS, ...(JSON.parse(raw) as ConnectionsMap) }
       : {};
+    // Scrub legacy plaintext credentials (including old test signatures)
+    // immediately, retaining the key in this tab until migration/save succeeds.
+    const safe = persistableConnections(map);
+    for (const id of Object.keys(map) as ProviderId[]) {
+      const conn = map[id];
+      if (!conn) continue;
+      if (conn.apiKey) sessionKeys.set(id, conn.apiKey);
+      conn.apiKey = sessionKeys.get(id) ?? '';
+      if (conn.testedSign?.includes('raw:')) {
+        conn.testedSign = undefined;
+        conn.connected = false;
+      }
+    }
+    if (raw && raw !== JSON.stringify(safe)) localStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
     // Migration: purana retired model save hai (e.g. gemini-2.0-flash jo
     // Google ne shutdown kar diya) to load par hi current model par map karo —
     // taaki user ko dobara settings na bharni pade aur 404 na aaye.
@@ -82,7 +113,11 @@ export function loadConnections(): ConnectionsMap {
 
 export function saveConnections(map: ConnectionsMap) {
   if (typeof window === 'undefined') return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+  for (const id of Object.keys(map) as ProviderId[]) {
+    if (map[id]?.apiKey) sessionKeys.set(id, map[id]!.apiKey);
+    else sessionKeys.delete(id);
+  }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(persistableConnections(map)));
   window.dispatchEvent(new Event('agentscope-connections-changed'));
 }
 
@@ -101,7 +136,16 @@ export function connectionSignature(config: {
   // the browser never sees the secret, but an edit to the model/baseUrl still
   // invalidates an older "Connected" badge.
   const keyIdentity =
-    config.apiKey && config.apiKey.length > 0 ? `raw:${config.apiKey}` : `hint:${config.keyHint ?? ''}`;
+    config.apiKey && config.apiKey.length > 0
+      ? (() => {
+          let identity = keyIdentities.get(config.apiKey!);
+          if (!identity) {
+            identity = crypto.randomUUID();
+            keyIdentities.set(config.apiKey!, identity);
+          }
+          return `session:${identity}`;
+        })()
+      : `hint:${config.keyHint ?? ''}`;
   return [keyIdentity, config.model ?? '', config.baseUrl ?? ''].join('|');
 }
 
@@ -143,6 +187,33 @@ export function useConnections() {
       setLoaded(true);
     };
     refresh();
+    // Best-effort migration: a failure keeps the key session-only, not on disk.
+    // Settings can retry saving it; never overwrite a newer edit on completion.
+    for (const [id, apiKey] of sessionKeys) {
+      const config = loadConnections()[id];
+      void (async () => {
+        try {
+          const res = await fetch(`/api/providers/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apiKey, model: config?.model, baseUrl: config?.baseUrl }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.hasKey) throw new Error('Encrypted key migration failed');
+          const current = loadConnections();
+          if (current[id]?.apiKey !== apiKey) return;
+          current[id] = { ...current[id]!, apiKey: '', serverStored: true, keyHint: data.keyHint, connected: false, testedSign: undefined };
+          saveConnections(current);
+          refresh();
+        } catch {
+          const current = loadConnections();
+          if (current[id]?.apiKey !== apiKey) return;
+          current[id]!.lastError = 'Key is session-only: encrypted server save failed. Save it in Settings before closing this tab.';
+          saveConnections(current);
+          refresh();
+        }
+      })();
+    }
     window.addEventListener('agentscope-connections-changed', refresh);
     window.addEventListener('storage', refresh);
     return () => {
@@ -175,6 +246,7 @@ export function useConnections() {
   const removeConnection = useCallback((id: ProviderId) => {
     const current = loadConnections();
     delete current[id];
+    sessionKeys.delete(id);
     saveConnections(current);
     setConnections(current);
     if (loadActiveProvider() === id) {

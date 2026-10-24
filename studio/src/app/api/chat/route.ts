@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { encodeChatEvent } from '@/lib/chat-stream';
 import { db } from '@/lib/db';
 import { getProvider, resolveModelWithNotice, modelNote } from '@/lib/providers';
 import {
@@ -59,6 +60,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (body.model?.trim() && !body.provider?.trim()) {
+      return Response.json({ error: 'An explicit model requires an explicit provider.' }, { status: 400 });
+    }
     const providerId = body.provider || 'zai';
     const provider = getProvider(providerId);
     if (!provider) {
@@ -342,43 +346,30 @@ Rules for this protocol:
 
     // ---- Wrap: stream to client while persisting full text ----
     let full = '';
-    let streamErrored = false;
-    const decoder = new TextEncoder();
+    let streamFailure: Error | undefined;
+    let cancelled = false;
+    const reader = upstream.getReader();
     const outStream = new ReadableStream<Uint8Array>({
       async start(controller) {
-        const reader = upstream.getReader();
         try {
           for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done || cancelled) break;
             full += value ?? '';
-            controller.enqueue(decoder.encode(value ?? ''));
+            controller.enqueue(encodeChatEvent({ type: 'text', text: value ?? '' }));
           }
         } catch (e) {
           // A user abort is not an error worth showing — the client is gone.
           if (!req.signal.aborted) {
-            streamErrored = true;
             const msg = e instanceof Error ? e.message : 'stream error';
-            // Never echo raw provider text (it can carry proxy details or a
-            // key fragment) — sanitise it, and keep it short.
-            controller.enqueue(
-              decoder.encode(`\n\n[Stream error: ${sanitizeProviderMessage(msg)}]`)
-            );
+            streamFailure = new Error(sanitizeProviderMessage(msg, apiKey ? [apiKey] : []));
           }
         }
-        // A reply with no text is a FAILURE, not a silent success: the user
-        // must be told why JARVIS said nothing (blocked / empty / upstream cut).
-        if (!full.trim() && !streamErrored && !req.signal.aborted) {
-          try {
-            controller.enqueue(
-              decoder.encode(
-                `⚠️ ${provider.name} ne khaali jawab bheja (model: ${usedModel}). Model ya key badal kar dekhiye.`
-              )
-            );
-          } catch {
-            /* stream already closed */
-          }
+        // Errors belong to the transport, NEVER the assistant text/TTS queue.
+        if (!full.trim() && !streamFailure && !req.signal.aborted && !cancelled) {
+          streamFailure = new Error(`${provider.name} returned an empty response.`);
         }
+
         try {
           if (full.trim()) {
             await db.message.create({
@@ -405,14 +396,26 @@ Rules for this protocol:
         } catch {
           // persistence failure should not break the stream
         }
-        controller.close();
+        if (!cancelled) {
+          if (streamFailure) {
+            const built = buildProviderFailure({
+              detail: streamFailure.message,
+              secrets: apiKey ? [apiKey] : [],
+              providerName: provider.name,
+              model: usedModel,
+            });
+            controller.enqueue(encodeChatEvent({ type: 'error', error: built.message, errorCategory: built.category, hint: built.hint }));
+          } else controller.enqueue(encodeChatEvent({ type: 'done' }));
+          controller.close();
+        }
       },
       cancel() {
+        cancelled = true;
         // Client disconnected mid-stream (Stop button / navigation): release
         // the upstream provider connection immediately. llm-core aborts the
         // fetch; the reader.cancel() below also unblocks a pending read().
         try {
-          void upstream.cancel();
+          void reader.cancel().catch(() => undefined);
         } catch {
           /* already closed */
         }
@@ -421,7 +424,8 @@ Rules for this protocol:
 
     return new Response(outStream, {
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'X-Chat-Stream': 'ndjson-v1',
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no',
         'Server-Timing': `setup;dur=${setupMs}, upstream;dur=${upstreamMs}`,

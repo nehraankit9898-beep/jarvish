@@ -3,6 +3,7 @@
 // engine use the EXACT SAME connection logic (no duplicate API clients).
 // Provider kinds: 'zai' (built-in SDK) | 'openai-compatible' | 'anthropic' | 'gemini'
 
+import { chatCompletionParameters, userFirstHistory } from './model-parameters';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -146,6 +147,7 @@ function sseTextStream(
   const decoder = new TextDecoder();
   let buffer = '';
   let closed = false;
+  let emitted = 0;
 
   /** Feed one complete line; returns the text pieces to emit. */
   const handleLine = (line: string): string[] => {
@@ -153,44 +155,57 @@ function sseTextStream(
     if (!trimmed.startsWith('data:')) return [];
     const data = trimmed.slice(5).trim();
     if (!data || data === '[DONE]') return [];
+    let json: any;
     try {
-      return extract(JSON.parse(data));
+      json = JSON.parse(data);
     } catch {
-      // a keep-alive line, a comment, or a partial payload that the next block
-      // completes — never a reason to kill the stream
-      return [];
+      return []; // ignore malformed JSON, not provider/extractor errors
     }
+    if (json?.error || json?.type === 'error') {
+      throw new Error(sanitizeProviderMessage(extractProviderErrorMessage(JSON.stringify(json))) || 'Provider stream error');
+    }
+    const pieces = extract(json);
+    emitted += pieces.join('').trim().length;
+    return pieces;
   };
 
   return new ReadableStream<string>({
     async pull(controller) {
       if (closed) return;
-      const { done, value } = await reader.read();
-      if (done) {
-        closed = true;
-        // flush the tail that never got its newline
-        if (buffer.trim()) {
-          for (const piece of handleLine(buffer)) {
-            if (piece) controller.enqueue(piece);
+      try {
+        // A TCP chunk may contain only half an SSE line (or a heartbeat).
+        // Keep reading until we enqueue text or finish; returning without an
+        // enqueue can leave a pending consumer read stranded indefinitely.
+        for (;;) {
+          const { done, value } = await reader.read();
+          buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = done ? '' : lines.pop() ?? '';
+          let enqueued = false;
+          for (const line of lines) {
+            for (const piece of handleLine(line)) {
+              if (piece) { controller.enqueue(piece); enqueued = true; }
+            }
           }
-          buffer = '';
+          if (done) {
+            closed = true;
+            if (!emitted) throw new Error('Provider returned an empty response');
+            controller.close();
+            return;
+          }
+          if (enqueued) return;
         }
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        for (const piece of handleLine(line)) {
-          if (piece) controller.enqueue(piece);
-        }
+      } catch (error) {
+        closed = true;
+        void reader.cancel().catch(() => undefined);
+        release?.();
+        controller.error(error);
       }
     },
     cancel() {
       closed = true;
       try {
-        void reader.cancel();
+        void reader.cancel().catch(() => undefined);
       } catch {
         /* already closed */
       }
@@ -208,6 +223,7 @@ function sseChunksFromOpenAI(response: Response, release?: UpstreamRelease): Rea
   return sseTextStream(
     response,
     (json) => {
+      if (json?.choices?.[0]?.finish_reason === 'content_filter') throw new Error('Provider blocked the response (content_filter)');
       const delta =
         json?.choices?.[0]?.delta?.content ??
         json?.choices?.[0]?.message?.content ??
@@ -237,97 +253,16 @@ function sseChunksFromAnthropic(response: Response, release?: UpstreamRelease): 
  * reported success. The block reason is now tracked and surfaced.
  */
 function sseChunksFromGemini(response: Response, release?: UpstreamRelease): ReadableStream<string> {
-  if (!response.body) throw new Error('The provider returned an empty stream');
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let closed = false;
-  let emitted = 0;
-  let blockReason = '';
-  let finishReason = '';
-
-  const handle = (line: string): string[] => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return [];
-    const data = trimmed.slice(5).trim();
-    if (!data || data === '[DONE]') return [];
-    let json: any;
-    try {
-      json = JSON.parse(data);
-    } catch {
-      return [];
-    }
+  return sseTextStream(response, (json) => {
     const summary = summarizeGeminiResponse(json);
-    if (summary.blockReason) blockReason = summary.blockReason;
-    if (summary.finishReason && summary.finishReason !== 'STOP') finishReason = summary.finishReason;
+    if (summary.blockReason || (summary.finishReason && !['STOP', 'MAX_TOKENS'].includes(summary.finishReason))) {
+      throw new Error(`Gemini returned no text or blocked the response (blockReason=${summary.blockReason || summary.finishReason})`);
+    }
     const parts = json?.candidates?.[0]?.content?.parts ?? [];
-    return Array.isArray(parts) ? parts.map((part: any) => (part?.text ? String(part.text) : '')) : [];
-  };
-
-  return new ReadableStream<string>({
-    async pull(controller) {
-      if (closed) return;
-      const { done, value } = await reader.read();
-      if (done) {
-        closed = true;
-        if (buffer.trim()) {
-          for (const piece of handle(buffer)) {
-            if (piece) {
-              emitted += piece.length;
-              controller.enqueue(piece);
-            }
-          }
-          buffer = '';
-        }
-        if (emitted === 0) {
-          // A 200 with no text is NOT a successful answer.
-          const status = blockReason ? 'blocked' : 'empty_response';
-          controller.error(
-            new Error(
-              `API error 200: Gemini returned no text (${blockReason ? `blockReason=${blockReason}` : 'empty response'}${
-                finishReason ? `, finishReason=${finishReason}` : ''
-              }) [category=${status}]`
-            )
-          );
-          return;
-        }
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        for (const piece of handle(line)) {
-          if (piece) {
-            emitted += piece.length;
-            controller.enqueue(piece);
-          }
-        }
-      }
-    },
-    cancel() {
-      closed = true;
-      try {
-        void reader.cancel();
-      } catch {
-        /* already closed */
-      }
-      try {
-        release?.();
-      } catch {
-        /* ignore */
-      }
-    },
-  });
-}
-
-async function* simulateStream(text: string) {
-  const pieces = text.match(/[\s\S]{1,4}/g) ?? [];
-  for (const piece of pieces) {
-    yield piece;
-    await new Promise((r) => setTimeout(r, 12));
-  }
+    return Array.isArray(parts)
+      ? parts.filter((part: any) => !part.thought).map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      : [];
+  }, release);
 }
 
 /**
@@ -380,18 +315,10 @@ async function streamFromZai(
     completion?.choices?.[0]?.content ??
     '';
   if (!content) throw new Error('Empty response from Z.ai');
-  const iterator = simulateStream(String(content));
   return new ReadableStream({
-    async pull(controller) {
-      // the Z.ai SDK takes no abort signal — but the simulated replay must
-      // still stop promptly when the caller went away (user pressed Stop)
-      if (signal?.aborted) {
-        controller.close();
-        return;
-      }
-      const { value, done } = await iterator.next();
-      if (done) controller.close();
-      else controller.enqueue(value);
+    start(controller) {
+      if (!signal?.aborted) controller.enqueue(String(content));
+      controller.close();
     },
   });
 }
@@ -407,6 +334,7 @@ export async function buildUpstreamStream(
   config: LLMConfig,
   providers: { getProvider: (id: string) => any }
 ): Promise<ReadableStream<string>> {
+  messages = userFirstHistory(messages);
   const provider = providers.getProvider(config.provider || 'zai');
   if (!provider) throw new Error(`Unknown provider: ${config.provider}`);
   const apiKey = config.apiKey?.trim() || '';
@@ -493,7 +421,7 @@ export async function buildUpstreamStream(
           role: m.role,
           content: openAiContent(m),
         })),
-        temperature,
+        ...chatCompletionParameters(model, temperature, config.maxTokens),
         stream: true,
       }),
       signal: upstreamSignal,

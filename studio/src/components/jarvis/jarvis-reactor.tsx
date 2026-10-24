@@ -13,11 +13,8 @@
  * loop, zero React re-renders per frame, DPR-capped, pauses when the tab is
  * hidden, honors prefers-reduced-motion (renders static color-correct frames).
  *
- * While `listening`, a real Web Audio AnalyserNode (getUserMedia) feeds the
- * mic RMS level into the core scale + ring speeds — the reactor genuinely
- * reacts to the microphone. If the mic stream is unavailable (permission,
- * insecure context) the reactor falls back to a gentle synthetic pulse and
- * never fakes activity.
+ * This visualizer never opens a microphone. An optional shared audioLevel
+ * may be supplied by the audio owner; otherwise the pulse is decorative.
  */
 
 import { useEffect, useRef } from 'react';
@@ -53,7 +50,7 @@ interface Particle {
   flat: number; // y-flatten for pseudo-3D shell
 }
 
-const PARTICLES: Particle[] = Array.from({ length: 150 }, (_, i) => ({
+const PARTICLES: Particle[] = Array.from({ length: 60 }, (_, i) => ({
   r: 2.0 + ((i * 7919) % 1000) / 1000 * 4.2,
   a: ((i * 3571) % 628) / 100,
   speed: 0.02 + (((i * 104729) % 100) / 100) * 0.05,
@@ -65,101 +62,22 @@ const PARTICLES: Particle[] = Array.from({ length: 150 }, (_, i) => ({
 export function JarvisReactor({
   state,
   className,
+  audioLevel = 0,
 }: {
   state: JarvisVisualState;
   className?: string;
+  audioLevel?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef<JarvisVisualState>(state);
 
+  const redrawRef = useRef<(() => void) | null>(null);
+  const micLevelRef = useRef(0);
   useEffect(() => {
     stateRef.current = state;
-  }, [state]);
-
-  // ---- real mic level (only while listening) ------------------------------
-  const micLevelRef = useRef(0);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const micBufRef = useRef<Float32Array<ArrayBuffer> | null>(null);
-  const micRafRef = useRef<number>(0);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const stopMic = () => {
-      cancelAnimationFrame(micRafRef.current);
-      micStreamRef.current?.getTracks().forEach((tr) => tr.stop());
-      micStreamRef.current = null;
-      audioCtxRef.current?.close().catch(() => undefined);
-      audioCtxRef.current = null;
-      analyserRef.current = null;
-      micLevelRef.current = 0;
-    };
-
-    if (state !== 'listening') {
-      stopMic();
-      return;
-    }
-
-    const startMic = async () => {
-      try {
-        if (
-          typeof navigator === 'undefined' ||
-          !navigator.mediaDevices?.getUserMedia
-        ) {
-          return; // insecure context / unsupported → synthetic pulse only
-        }
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((tr) => tr.stop());
-          return;
-        }
-        micStreamRef.current = stream;
-        const Ctx =
-          window.AudioContext ??
-          (window as unknown as { webkitAudioContext: typeof AudioContext })
-            .webkitAudioContext;
-        const ctx = new Ctx();
-        audioCtxRef.current = ctx;
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 1024;
-        analyser.smoothingTimeConstant = 0.55;
-        src.connect(analyser);
-        analyserRef.current = analyser;
-        micBufRef.current = new Float32Array(analyser.fftSize);
-
-        // RMS sample loop — same noise-gate model as the reference
-        // (clamp((rms - 0.012) / 0.28, 0, 1))
-        const tick = () => {
-          const an = analyserRef.current;
-          const buf = micBufRef.current;
-          if (an && buf) {
-            an.getFloatTimeDomainData(buf);
-            let sum = 0;
-            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-            const rms = Math.sqrt(sum / buf.length);
-            const level = Math.min(1, Math.max(0, (rms - 0.012) / 0.28));
-            micLevelRef.current = level;
-          }
-          micRafRef.current = requestAnimationFrame(tick);
-        };
-        micRafRef.current = requestAnimationFrame(tick);
-      } catch {
-        // mic denied → the reactor keeps a synthetic pulse; the mic button in
-        // the composer surfaces the real permission error.
-      }
-    };
-
-    void startMic();
-    return () => {
-      cancelled = true;
-      stopMic();
-    };
-  }, [state]);
+    micLevelRef.current = Number.isFinite(audioLevel) ? Math.max(0, Math.min(1, audioLevel)) : 0;
+    redrawRef.current?.();
+  }, [state, audioLevel]);
 
   // ---- the single render loop ---------------------------------------------
   useEffect(() => {
@@ -168,16 +86,14 @@ export function JarvisReactor({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const reducedMotion =
-      typeof window !== 'undefined' &&
-      typeof window.matchMedia === 'function' &&
-      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let reducedMotion = motionQuery.matches;
 
     let raf = 0;
     let running = true;
     let width = 0;
     let height = 0;
-    const dpr = Math.min(2, typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+    const dpr = Math.min(1.25, typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
 
     // current interpolated color + energy (persist across frames)
     let cur: RGB = [...STATE_COLORS[stateRef.current]] as RGB;
@@ -193,6 +109,7 @@ export function JarvisReactor({
       canvas.height = Math.max(1, Math.floor(height * dpr));
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
+      redrawRef.current?.();
     };
     resize();
     const ro = new ResizeObserver(resize);
@@ -203,7 +120,7 @@ export function JarvisReactor({
       const target = STATE_COLORS[st];
 
       // color lerp (reference: 0.06 per frame)
-      cur = [
+      cur = reducedMotion ? [...target] as RGB : [
         lerp(cur[0], target[0], 0.06),
         lerp(cur[1], target[1], 0.06),
         lerp(cur[2], target[2], 0.06),
@@ -403,12 +320,17 @@ export function JarvisReactor({
       ctx.globalCompositeOperation = 'source-over';
     };
 
+    let lastFrame = -Infinity;
     const loop = (now: number) => {
       if (!running) return;
-      drawFrame((now - start) / 1000);
+      if (now - lastFrame >= 1000 / 30) {
+        drawFrame((now - start) / 1000);
+        lastFrame = now;
+      }
       raf = requestAnimationFrame(loop);
     };
 
+    redrawRef.current = () => { if (reducedMotion) drawFrame(0); };
     if (reducedMotion) {
       drawFrame(0);
     } else {
@@ -425,12 +347,22 @@ export function JarvisReactor({
         raf = requestAnimationFrame(loop);
       }
     };
+    const onMotionChange = () => {
+      reducedMotion = motionQuery.matches;
+      cancelAnimationFrame(raf);
+      running = !document.hidden;
+      if (reducedMotion) drawFrame(0);
+      else if (running) raf = requestAnimationFrame(loop);
+    };
+    motionQuery.addEventListener('change', onMotionChange);
     document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
       running = false;
       cancelAnimationFrame(raf);
       ro.disconnect();
+      redrawRef.current = null;
+      motionQuery.removeEventListener('change', onMotionChange);
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);

@@ -90,7 +90,7 @@ async function respond(provider: string, query: ModelQuery) {
       cached: live.source === 'cache',
       fetchedAt: live.fetchedAt,
       chatOnly: !includeAll,
-      filteredOut: live.models.length - chatOnly.length,
+      filteredOut: live.filteredOut ?? live.models.length - chatOnly.length,
       provider: provider,
       selected: selected.model,
       ...(selected.notice ? { selectedNotice: selected.notice } : {}),
@@ -101,7 +101,7 @@ async function respond(provider: string, query: ModelQuery) {
   }
 
   // Fallback: the static catalogue. Explicitly labelled — never "live".
-  const catalog = catalogModels(provider).map(decorate);
+  const catalog = provider === 'ollama' ? [] : catalogModels(provider).map(decorate);
   return Response.json({
     models: includeAll ? catalog : catalog.filter((m) => m.chat !== false),
     source: 'catalog',
