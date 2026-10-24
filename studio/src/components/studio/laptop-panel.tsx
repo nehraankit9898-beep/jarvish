@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -22,6 +22,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { toast } from '@/hooks/use-toast';
+import { usePolling } from '@/hooks/use-polling';
 
 interface Pending {
   id: string;
@@ -115,9 +116,9 @@ export function LaptopPanel() {
   const [histEntries, setHistEntries] = useState<HistoryEntry[] | null>(null);
   const [histNote, setHistNote] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/host');
+      const res = await fetch('/api/host', { signal });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
       setStatus(await res.json());
       setError(null);
@@ -125,22 +126,16 @@ export function LaptopPanel() {
       setError(e instanceof Error ? e.message : 'Failed to load');
     }
     try {
-      const res = await fetch('/api/laptop');
+      const res = await fetch('/api/laptop', { signal });
       if (res.ok) setLaptop(await res.json());
     } catch {
       /* the laptop status is additive — host approvals still show */
     }
   }, []);
 
-  useEffect(() => {
-    // approvals expire after 10 minutes and arrive while you work — keep the list fresh
-    const first = setTimeout(() => void load(), 0);
-    const t = setInterval(() => void load(), 3000);
-    return () => {
-      clearTimeout(first);
-      clearInterval(t);
-    };
-  }, [load]);
+  // approvals expire after 10 minutes and arrive while you work — keep the
+  // list fresh (skipped while hidden, never overlapping, aborted on unmount)
+  usePolling(load, 3000);
 
   const decide = async (id: string, op: 'approve' | 'deny') => {
     setBusy(id);

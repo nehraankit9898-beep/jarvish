@@ -1,7 +1,12 @@
 import { NextRequest } from 'next/server';
 import { db } from '@/lib/db';
 import { getProvider, resolveModel } from '@/lib/providers';
-import { buildUpstreamStream, type CoreChatMessage } from '@/lib/llm-core';
+import {
+  buildUpstreamStream,
+  capHistoryContext,
+  parseApiError,
+  type CoreChatMessage,
+} from '@/lib/llm-core';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { isCapabilityQuestion, JARVIS_CAPABILITIES_PROMPT } from '@/lib/agentic/jarvis';
 import { relevantMemoryContext } from '@/lib/agentic/memory';
@@ -23,6 +28,10 @@ interface ChatRequestBody {
 export async function POST(req: NextRequest) {
   const denied = rejectIfUnauthorized(req);
   if (denied) return denied;
+  // Server-Timing diagnostics (Rule 8): setup = request parsing + DB reads,
+  // upstream = time to open the provider stream. Cheap (two Date.now calls).
+  const t0 = Date.now();
+  let setupMs = 0;
   try {
     const body = (await req.json()) as ChatRequestBody;
     const { conversationId, content, agentId } = body;
@@ -96,7 +105,7 @@ Rules for this protocol:
       data: { conversationId, role: 'user', content },
     });
 
-    // Build message history (last 40 messages)
+    // Build message history (last 40 messages, newest-first fetch)
     // NOTE: fetch DESC and reverse — `orderBy asc + take 40` would return the
     // OLDEST 40 messages, so in a long conversation the model would never see
     // the current question.
@@ -106,12 +115,20 @@ Rules for this protocol:
       take: 40,
     });
     const history = recent.reverse();
+    // ...then bound by characters too (long code dumps in old messages must
+    // not balloon every prompt — the newest message always survives).
+    const capped = capHistoryContext<CoreChatMessage>(
+      history.map(
+        (m): CoreChatMessage => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content,
+        })
+      ),
+      { maxMessages: 40, maxChars: 24_000 }
+    );
     const messages: CoreChatMessage[] = [
       { role: 'system', content: systemPrompt },
-      ...history.map((m) => ({
-        role: m.role === 'assistant' ? ('assistant' as const) : ('user' as const),
-        content: m.content,
-      })),
+      ...capped,
     ];
 
     const temperature = body.temperature ?? 0.7;
@@ -119,6 +136,13 @@ Rules for this protocol:
     const usedModel = resolveModel(provider, body.model);
 
     // ---- Connect for real (via shared llm-core layer) ----
+    // The request signal is forwarded: the user's Stop button aborts the
+    // upstream provider call too (previously it kept running server-side).
+    // Interactive chat stays single-target and fail-fast on purpose — an
+    // automatic provider switch mid-conversation would change the voice of
+    // the reply; bounded retries live in the agentic ModelRouter instead.
+    setupMs = Date.now() - t0;
+    const upstreamOpenedAt = Date.now();
     let upstream: ReadableStream<string>;
     try {
       upstream = await buildUpstreamStream(messages, {
@@ -127,14 +151,40 @@ Rules for this protocol:
         model: usedModel,
         baseUrl: body.baseUrl,
         temperature,
+        signal: req.signal,
       }, { getProvider });
     } catch (err) {
+      // A provider 429 keeps its status + Retry-After so the UI can say
+      // "rate limited, retry in Ns" instead of a generic 502.
+      const parsed = parseApiError(err);
+      if (parsed.status === 429) {
+        return new Response(
+          JSON.stringify({
+            error: 'Provider rate limit reached.',
+            retryAfterSec: parsed.retryAfterSec,
+          }),
+          {
+            status: 429,
+            headers: {
+              'Content-Type': 'application/json',
+              ...(parsed.retryAfterSec != null
+                ? { 'Retry-After': String(Math.ceil(parsed.retryAfterSec)) }
+                : {}),
+            },
+          }
+        );
+      }
+      // The client went away before the upstream opened — nothing to report.
+      if (req.signal.aborted) {
+        return new Response(null, { status: 499 });
+      }
       console.error('[chat] upstream connection failed:', err);
       return new Response(JSON.stringify({ error: 'Unable to reach the model provider.' }), {
         status: 502,
         headers: { 'Content-Type': 'application/json' },
       });
     }
+    const upstreamMs = Date.now() - upstreamOpenedAt;
 
     // ---- Wrap: stream to client while persisting full text ----
     let full = '';
@@ -150,8 +200,11 @@ Rules for this protocol:
             controller.enqueue(decoder.encode(value ?? ''));
           }
         } catch (e) {
-          const msg = e instanceof Error ? e.message : 'stream error';
-          controller.enqueue(decoder.encode(`\n\n[Stream error: ${msg}]`));
+          // A user abort is not an error worth showing — the client is gone.
+          if (!req.signal.aborted) {
+            const msg = e instanceof Error ? e.message : 'stream error';
+            controller.enqueue(decoder.encode(`\n\n[Stream error: ${msg}]`));
+          }
         }
         try {
           if (full.trim()) {
@@ -181,6 +234,16 @@ Rules for this protocol:
         }
         controller.close();
       },
+      cancel() {
+        // Client disconnected mid-stream (Stop button / navigation): release
+        // the upstream provider connection immediately. llm-core aborts the
+        // fetch; the reader.cancel() below also unblocks a pending read().
+        try {
+          void upstream.cancel();
+        } catch {
+          /* already closed */
+        }
+      },
     });
 
     return new Response(outStream, {
@@ -188,6 +251,7 @@ Rules for this protocol:
         'Content-Type': 'text/plain; charset=utf-8',
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no',
+        'Server-Timing': `setup;dur=${setupMs}, upstream;dur=${upstreamMs}`,
       },
     });
   } catch (err) {

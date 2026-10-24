@@ -32,11 +32,13 @@ export async function POST(req: NextRequest) {
   // hard cap — a whole essay is not a voice reply (the bridge re-caps at 3000)
   const text = raw.slice(0, 3000);
 
+  // req.signal: client interrupted speech (Stop / new sentence-session) —
+  // the bridge wait ends immediately instead of running the 45 s timeout.
   const result = await voiceCall('/tts', {
     text,
     voice: body.voice,
     rate: body.rate,
-  }, { raw: true, timeoutMs: 45_000 });
+  }, { raw: true, timeoutMs: 45_000, signal: req.signal });
 
   if (!result.ok || !result.buffer) {
     await recordAudit({

@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/hooks/use-toast';
+import { usePolling } from '@/hooks/use-polling';
 
 interface NotificationItem {
   id: string;
@@ -46,9 +47,9 @@ export function NotificationsBell() {
   const [unread, setUnread] = useState(0);
   const [open, setOpen] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/notifications?limit=30');
+      const res = await fetch('/api/notifications?limit=30', { signal });
       if (!res.ok) return;
       const data = await res.json();
       setItems(data.notifications ?? []);
@@ -58,16 +59,8 @@ export function NotificationsBell() {
     }
   }, []);
 
-  useEffect(() => {
-    // mount-time fetch is deferred one tick so the effect never sets state
-    // synchronously (react-hooks/set-state-in-effect)
-    const first = setTimeout(load, 0);
-    const timer = setInterval(load, 30_000); // light polling
-    return () => {
-      clearTimeout(first);
-      clearInterval(timer);
-    };
-  }, [load]);
+  // light polling (mount fetch stays async — never sets state synchronously)
+  usePolling(load, 30_000);
 
   // refresh when the dropdown opens
   useEffect(() => {
