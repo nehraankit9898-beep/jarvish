@@ -211,3 +211,4 @@ Setup (kuch naya install nahi):
 `bun install` + `bunx prisma generate` + `bun run db:push`
 `bun test` -> 773/773 pass hona chahiye
 "# Jarvish" 
+"# Jarvish" 
