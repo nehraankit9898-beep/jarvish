@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -102,6 +102,9 @@ export function SettingsDialog({
     Record<string, { hasKey: boolean; keyHint: string; lastTestOk: boolean | null; lastError: string }>
   >({});
   const [saving, setSaving] = useState(false);
+  const discoveryRef = useRef<AbortController | null>(null);
+  const revisionRef = useRef(0);
+  useEffect(() => { revisionRef.current++; }, [selected]);
 
   const provider = PROVIDERS.find((p) => p.id === selected)!;
   const saved = connections[selected];
@@ -127,6 +130,7 @@ export function SettingsDialog({
 
   /** Any edit invalidates the previous test result (spec §9). */
   const setDraft = (patch: Partial<typeof draft>) => {
+    revisionRef.current++;
     setDrafts((prev) => ({ ...prev, [selected]: { ...draft, ...patch } }));
     setTestStates((prev) => ({ ...prev, [selected]: 'idle' }));
     updateConnection(selected, { connected: false, testedAt: undefined });
@@ -178,6 +182,9 @@ export function SettingsDialog({
         model: connections[id]?.model ?? info.defaultModel,
         baseUrl: connections[id]?.baseUrl || info.baseUrl,
       };
+      discoveryRef.current?.abort();
+      const controller = new AbortController();
+      discoveryRef.current = controller;
       setModelLists((prev) => ({
         ...prev,
         [id]: { ...(prev[id] ?? { models: [], source: 'catalog', cached: false }), loading: true },
@@ -186,6 +193,7 @@ export function SettingsDialog({
         // POST, not GET: an unsaved key must never travel in a URL.
         const res = await fetch(`/api/providers/${id}/models`, {
           method: 'POST',
+          signal: controller.signal,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             apiKey: current.apiKey || undefined,
@@ -202,6 +210,7 @@ export function SettingsDialog({
           note?: string;
           error?: string;
         };
+        if (controller.signal.aborted) return;
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
         setModelLists((prev) => ({
           ...prev,
@@ -216,6 +225,7 @@ export function SettingsDialog({
           },
         }));
       } catch (err) {
+        if (controller.signal.aborted) return;
         setModelLists((prev) => ({
           ...prev,
           [id]: {
@@ -229,18 +239,27 @@ export function SettingsDialog({
     [connections, drafts]
   );
 
-  // fetch the live list the first time a provider is opened
+  // Debounce key/endpoint edits. A previous key's response must never replace
+  // the current draft's list. Discovery is NOT an inference/accessibility test.
   useEffect(() => {
+    discoveryRef.current?.abort();
     if (!open) return;
-    if (modelLists[selected]?.models?.length || modelLists[selected]?.loading) return;
-    void loadModels(selected);
+    setModelLists((prev) => ({ ...prev, [selected]: { models: [], source: 'catalog', cached: false, loading: true } }));
+    const timer = setTimeout(() => void loadModels(selected), 650);
+    return () => {
+      clearTimeout(timer);
+      discoveryRef.current?.abort();
+    };
+    // Only connection identity changes trigger discovery, not model selection
+    // or a list/loading update.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, open]);
+  }, [selected, open, draft.apiKey, draft.baseUrl, serverInfo?.hasKey]);
 
-  const handleSave = async () => {
-    if (saving) return;
+  const handleSave = async (verified = testStates[selected] === 'success') => {
+    if (saving) return false;
     setSaving(true);
-    const testPassed = testStates[selected] === 'success';
+    const revision = revisionRef.current;
+    const testPassed = verified;
     // 1) persist the configuration SERVER-SIDE (key encrypted, never echoed).
     let keyHint = saved?.keyHint ?? serverInfo?.keyHint ?? '';
     let serverStored = saved?.serverStored ?? serverInfo?.hasKey ?? false;
@@ -264,20 +283,22 @@ export function SettingsDialog({
         error?: string;
       };
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (draft.apiKey.trim() && !data.hasKey) throw new Error('Server did not confirm encrypted key storage.');
       if (data.hasKey) {
         serverStored = true;
         keyHint = data.keyHint ?? '';
       }
     } catch (err) {
-      // The browser copy still works for chat, so this is a warning, not a
-      // hard failure — but it must be VISIBLE.
+      // Never fall back to plaintext browser storage when encryption fails.
       toast({
-        title: 'Saved in browser only',
+        title: 'Configuration not saved',
         description:
           (err instanceof Error ? err.message : 'server save failed') +
           ' — the key could not be stored encrypted on the server.',
         variant: 'destructive',
       });
+      setSaving(false);
+      return false;
     }
 
     // The verification signature must describe the configuration that is stored
@@ -312,6 +333,9 @@ export function SettingsDialog({
         lastError: prev[selected]?.lastError ?? '',
       },
     }));
+    if (revisionRef.current === revision) {
+      setDrafts((prev) => ({ ...prev, [selected]: { ...draft, apiKey: '' } }));
+    }
     setSaving(false);
     toast({
       title: 'Saved ✓',
@@ -319,9 +343,11 @@ export function SettingsDialog({
         ? `${provider.name} configuration saved and verified.`
         : `${provider.name} configuration saved. Connection NOT verified — run Test connection.`,
     });
+    return true;
   };
 
   const handleTest = async () => {
+    const revision = revisionRef.current;
     setTestStates((prev) => ({ ...prev, [selected]: 'testing' }));
     setTestMessages((prev) => ({ ...prev, [selected]: { ok: false, message: '' } }));
     try {
@@ -345,6 +371,7 @@ export function SettingsDialog({
         model?: string;
         notice?: { reason?: string };
       };
+      if (revisionRef.current !== revision) return;
       if (json.ok) {
         const signature = connectionSignature({
           apiKey: draft.apiKey,
@@ -370,7 +397,7 @@ export function SettingsDialog({
           toast({ title: 'Model note', description: json.notice.reason });
         }
         // a verified key is worth persisting right away (encrypted server-side)
-        if (draft.apiKey.trim()) void handleSave();
+        if (draft.apiKey.trim()) await handleSave(true);
         void loadModels(selected, { refresh: true });
       } else {
         setTestStates((prev) => ({ ...prev, [selected]: 'error' }));
@@ -397,6 +424,7 @@ export function SettingsDialog({
         });
       }
     } catch (err) {
+      if (revisionRef.current !== revision) return;
       const msg = err instanceof Error ? err.message : 'Network error';
       setTestStates((prev) => ({ ...prev, [selected]: 'error' }));
       setTestMessages((prev) => ({ ...prev, [selected]: { ok: false, message: msg } }));
@@ -422,7 +450,7 @@ export function SettingsDialog({
       });
       return;
     }
-    await handleSave();
+    if (!(await handleSave())) return;
     switchProvider(selected);
     toast({
       title: `${provider.emoji} ${provider.name} activated`,
@@ -655,7 +683,7 @@ export function SettingsDialog({
                             list replaced the catalog (never a blank picker) */}
                         {(modelLists[selected]?.models?.length
                           ? modelLists[selected]!.models
-                          : provider.models.map((id): ModelOption => ({ id }))
+                          : (selected === 'ollama' ? [] : provider.models.map((id): ModelOption => ({ id })))
                         ).map((m) => (
                           <SelectItem key={m.id} value={m.id} className="text-zinc-100">
                             <span className="font-mono text-xs">{m.id}</span>
@@ -682,17 +710,15 @@ export function SettingsDialog({
                   </div>
                 )}
 
-                {selected === 'custom' && (
-                  <div className="space-y-2">
-                    <Label className="text-zinc-300">Model name</Label>
-                    <Input
-                      value={draft.model}
-                      onChange={(e) => setDraft({ model: e.target.value })}
-                      placeholder="e.g. my-model"
-                      className="bg-zinc-800 border-zinc-700 text-zinc-100 font-mono text-sm"
-                    />
-                  </div>
-                )}
+                <div className="space-y-2">
+                  <Label className="text-zinc-300">Exact model ID (manual override)</Label>
+                  <Input
+                    value={draft.model}
+                    onChange={(e) => setDraft({ model: e.target.value })}
+                    placeholder="e.g. my-model"
+                    className="bg-zinc-800 border-zinc-700 text-zinc-100 font-mono text-sm"
+                  />
+                </div>
 
                 <div className="flex flex-wrap gap-2 pt-1">
                   <Button

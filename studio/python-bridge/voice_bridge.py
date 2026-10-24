@@ -44,7 +44,7 @@ PORT = 8792
 TOKEN = ""
 KILL_FLAG = ""
 STATE_DIR = ""
-TTS_VOICE_DEFAULT = os.environ.get("AGENTSCOPE_TTS_VOICE", "hi-IN-MadhurNeural")
+TTS_VOICE_DEFAULT = os.environ.get("AGENTSCOPE_TTS_VOICE", "en-IN-NeerjaNeural")
 WAKE_SENSITIVITY = float(os.environ.get("AGENTSCOPE_WAKE_SENSITIVITY", "0.5"))
 WAKE_MODEL_DIR = os.environ.get("AGENTSCOPE_WAKE_MODEL_DIR", "")
 

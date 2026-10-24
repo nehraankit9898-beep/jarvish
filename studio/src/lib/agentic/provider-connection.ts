@@ -18,6 +18,8 @@
 //   4. Loopback is allowed for user-configured local servers (Ollama, LM
 //      Studio, vLLM) but every other SSRF rule still applies.
 
+import { createHash } from 'node:crypto';
+import { chatCompletionParameters } from '@/lib/model-parameters';
 import { getProvider, resolveModelWithNotice } from '@/lib/providers';
 import { hasZaiSdkConfig, ZAI_NOT_CONFIGURED } from '@/lib/llm-core';
 import { assertOutboundUrl, OutboundUrlError } from './outbound';
@@ -207,11 +209,7 @@ function success(
 
 /** A stable key for the model-list cache (never stores the raw key). */
 function cacheKey(providerId: string, baseUrl: string, apiKey: string): string {
-  // cheap non-crypto digest: only needs to separate different keys
-  let hash = 0;
-  const src = `${providerId}|${baseUrl}|${apiKey}`;
-  for (let i = 0; i < src.length; i++) hash = (hash * 31 + src.charCodeAt(i)) | 0;
-  return `models:${providerId}:${hash}`;
+  return createHash('sha256').update(JSON.stringify([providerId, baseUrl, apiKey])).digest('hex');
 }
 
 interface CacheEntry {
@@ -330,8 +328,7 @@ async function runConnectionTest(
         body: JSON.stringify({
           model,
           messages: [{ role: 'user', content: TEST_PROMPT }],
-          max_tokens: 32,
-          temperature: 0,
+          ...chatCompletionParameters(model, 0, 1024),
           stream: false,
         }),
         signal,
@@ -482,7 +479,7 @@ export async function testProviderConnection(
 
 /** Regexes for model families that are NOT chat models. */
 const NON_CHAT_GEMINI = /(embedding|embed|imagen|veo|image|tts|audio|live|native-audio|computer-use|deep-research|aqa)/i;
-const NON_CHAT_GENERIC = /(embedding|embed-|whisper|tts|moderation|rerank|dall-e|stable-diffusion|image)/i;
+const NON_CHAT_GENERIC = /(embedding|embed-|whisper|tts|moderation|rerank|dall-e|stable-diffusion|image|transcribe|realtime|audio|sora|veo)/i;
 
 function geminiModelToEntry(m: any): ProviderModel | null {
   const rawId = typeof m?.name === 'string' ? m.name : '';
@@ -563,7 +560,7 @@ export async function listProviderModels(
   }
   const timeoutMs = Math.min(60_000, Math.max(5_000, input.timeoutMs ?? 20_000));
   const apiKey = input.apiKey?.trim() ?? '';
-  const key = cacheKey(providerId, baseUrl, apiKey);
+  const key = `${cacheKey(providerId, baseUrl, apiKey)}:${Boolean(input.includeNonChat)}`;
 
   if (!input.refresh) {
     const hit = modelCache().get(key);
@@ -593,52 +590,62 @@ export async function listProviderModels(
     const base = url.toString().replace(/\/+$/, '');
     const signal = AbortSignal.timeout(timeoutMs);
 
-    const query =
-      info.kind === 'gemini'
-        ? // 1000 is the documented page size; pageToken handled below
-          `${base}/models?pageSize=1000`
-        : `${base}/models`;
-
-    const res = await fetch(query, {
-      method: 'GET',
-      headers: {
-        ...(apiKey
-          ? info.kind === 'gemini'
-            ? { 'x-goog-api-key': apiKey }
-            : info.kind === 'anthropic'
-              ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
-              : { Authorization: `Bearer ${apiKey}` }
-          : {}),
-        ...(providerId === 'openrouter'
-          ? {
-              'HTTP-Referer': process.env.AGENTSCOPE_PUBLIC_URL || 'http://localhost:3000',
-              'X-Title': 'AgentScope Studio JARVIS',
-            }
-          : {}),
-      },
-      signal,
-    });
-    if (!res.ok) return fail(await errorFromResponse(res));
-
-    const json = await res.json().catch(() => null);
-    if (!json || typeof json !== 'object') return fail('the model list was not JSON');
-
+    // Ollama's native tags endpoint reflects installed models, not a static
+    // catalogue. Its OpenAI-compatible base URL normally ends in /v1.
+    const ollama = providerId === 'ollama';
+    const endpoint = ollama ? `${base.replace(/\/v1$/, '')}/api/tags` : `${base}/models`;
+    const headers: Record<string, string> = {
+      ...(apiKey
+        ? info.kind === 'gemini'
+          ? { 'x-goog-api-key': apiKey }
+          : info.kind === 'anthropic'
+            ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+            : { Authorization: `Bearer ${apiKey}` }
+        : {}),
+      ...(providerId === 'openrouter'
+        ? {
+            'HTTP-Referer': process.env.AGENTSCOPE_PUBLIC_URL || 'http://localhost:3000',
+            'X-Title': 'AgentScope Studio JARVIS',
+          }
+        : {}),
+    };
     let entries: ProviderModel[] = [];
-    if (info.kind === 'gemini') {
-      const list = Array.isArray((json as any).models) ? (json as any).models : [];
-      entries = list.map(geminiModelToEntry).filter((m: ProviderModel | null): m is ProviderModel => Boolean(m));
-    } else if (info.kind === 'anthropic') {
-      const list = Array.isArray((json as any).data) ? (json as any).data : [];
-      entries = list.map(anthropicModelToEntry).filter((m: ProviderModel | null): m is ProviderModel => Boolean(m));
-    } else {
-      const list = Array.isArray((json as any).data) ? (json as any).data : [];
-      entries =
-        providerId === 'openrouter'
-          ? list.map(openRouterModelToEntry).filter((m: ProviderModel | null): m is ProviderModel => Boolean(m))
-          : list.map(openAiModelToEntry).filter((m: ProviderModel | null): m is ProviderModel => Boolean(m));
+    let cursor = '';
+    const cursors = new Set<string>();
+    // One deadline across ALL pages; never follow provider-supplied URLs
+    // with credentials. Only opaque cursor values are copied to our endpoint.
+    for (let page = 0; ; page++) {
+      if (page >= 100) return fail('Model pagination exceeded 100 pages');
+      const query = new URL(endpoint);
+      if (info.kind === 'gemini') {
+        query.searchParams.set('pageSize', '1000');
+        if (cursor) query.searchParams.set('pageToken', cursor);
+      } else if (info.kind === 'anthropic') {
+        query.searchParams.set('limit', '1000');
+        if (cursor) query.searchParams.set('after_id', cursor);
+      }
+      const res = await fetch(query.toString(), { method: 'GET', headers, signal });
+      if (!res.ok) return fail(await errorFromResponse(res));
+      const json = await res.json().catch(() => null);
+      if (!json || typeof json !== 'object') return fail('the model list was not JSON');
+      const list = ollama || info.kind === 'gemini' ? json.models : json.data;
+      if (!Array.isArray(list)) return fail('the model list has an invalid format');
+      const convert = ollama
+        ? (m: any) => openAiModelToEntry({ id: m.name ?? m.model })
+        : info.kind === 'gemini' ? geminiModelToEntry
+        : info.kind === 'anthropic' ? anthropicModelToEntry
+        : providerId === 'openrouter' ? openRouterModelToEntry : openAiModelToEntry;
+      entries.push(...list.map(convert).filter((m: ProviderModel | null): m is ProviderModel => Boolean(m)));
+      const next = info.kind === 'gemini' ? json.nextPageToken
+        : info.kind === 'anthropic' && json.has_more ? json.last_id : '';
+      if (info.kind === 'anthropic' && json.has_more && !next) return fail('Missing model pagination cursor');
+      if (!next) break;
+      if (typeof next !== 'string' || cursors.has(next)) return fail('Invalid or repeated model pagination cursor');
+      cursors.add(next);
+      cursor = next;
     }
 
-    if (!entries.length) return fail('the provider returned an empty model list');
+    if (!entries.length) return fail(ollama ? 'No installed Ollama models. Install a model with ollama pull <model>, then refresh.' : 'the provider returned an empty model list');
 
     // De-duplicate by id (some gateways repeat entries) and keep provider order.
     const seen = new Set<string>();
@@ -649,6 +656,9 @@ export async function listProviderModels(
     const offered = input.includeNonChat ? entries : chatOnly;
     if (!offered.length) {
       return fail('the provider offers no chat-capable model');
+    }
+    if (modelCache().size >= 200 && !modelCache().has(key)) {
+      modelCache().delete(modelCache().keys().next().value!);
     }
     modelCache().set(key, { models: offered, fetchedAt: Date.now(), filteredOut });
     return {

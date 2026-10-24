@@ -1,6 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { readChatText } from '@/lib/chat-stream';
+
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -282,7 +284,7 @@ export function Studio() {
   // ---- voice (Roadmap #6): mic input + spoken replies — browser-native ----
   // BUGFIX (settings must stick): mic language now persists like hands-free /
   // wake-sensitivity do — it used to reset to hi-IN on every page reload.
-  const [micLang, setMicLang] = useState<VoiceLang>('hi-IN');
+  const [micLang, setMicLang] = useState<VoiceLang>('en-IN');
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem('agentscope-mic-lang');
@@ -413,7 +415,7 @@ export function Studio() {
   // callback whenever TTS is enabled/disabled — call the LATEST one through a
   // ref, or the first-render closure (enabled=false) silences the greeting
   const ttsRef = useRef(tts);
-  ttsRef.current = tts;
+  useLayoutEffect(() => { ttsRef.current = tts; }, [tts]);
 
   // A retired model id found in localStorage is rewritten to a supported one
   // when settings load. That substitution must never be silent (spec §5), so
@@ -1056,8 +1058,6 @@ export function Studio() {
         ttsRef.current.speak(notice);
       }
 
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
       let full = '';
       let pending = '';
       let lastFlush = 0;
@@ -1076,10 +1076,7 @@ export function Studio() {
           return next;
         });
       };
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
+      for await (const chunk of readChatText(res)) {
         if (!chunk) continue;
         if (!ttftRecorded) {
           ttftRecorded = true;
@@ -1168,7 +1165,7 @@ export function Studio() {
   };
 
   // latest sendMessage for the LIVE loop (avoids stale closures)
-  sendRef.current = sendMessage;
+  useLayoutEffect(() => { sendRef.current = sendMessage; });
 
   const handleAgentDialogSave = async (agent: AgentData) => {
     await saveAgent(agent);

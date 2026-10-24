@@ -41,6 +41,7 @@ function getRecognitionCtor(): RecognitionCtor | null {
 /** Strip markdown/syntax noise so the TTS voice reads clean sentences. */
 export function speechFriendly(text: string): string {
   return String(text ?? '')
+    .replace(/\[Stream error:[\s\S]*?(?:\]|$)/gi, '')
     .replace(/```[\s\S]*?```/g, ' (code block) ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!?\[([^\]]*)]\([^)]*\)/g, '$1')
@@ -49,6 +50,14 @@ export function speechFriendly(text: string): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 1200);
+}
+
+export function pickSpeechVoice<T extends { lang: string }>(voices: T[]): T | null {
+  return voices.find((v) => v.lang.toLowerCase() === 'en-in')
+    ?? voices.find((v) => v.lang.toLowerCase() === 'hi-in')
+    ?? voices.find((v) => /^en(?:-|$)/i.test(v.lang))
+    ?? voices.find((v) => /^hi(?:-|$)/i.test(v.lang))
+    ?? null;
 }
 
 export type VoiceLang = 'hi-IN' | 'en-IN';
@@ -102,7 +111,7 @@ export function useVoiceInput(opts: {
   lang?: VoiceLang;
   onFinal?: (transcript: string) => void;
 } = {}) {
-  const { lang = 'hi-IN', onFinal } = opts;
+  const { lang = 'en-IN', onFinal } = opts;
   const [supported, setSupported] = useState(false);
   const [listening, setListening] = useState(false);
   const [interim, setInterim] = useState('');
@@ -267,7 +276,7 @@ export async function runSpeechChain(
   //    natural, par offline + zero-setup)
   if (!deps.browserSynthAvailable()) {
     onSpeaking(false);
-    onError?.('Voice unavailable: the server voice bridge is not running and this browser has no speechSynthesis.');
+    onError?.('Voice unavailable: the server voice bridge is not running and this browser has no compatible Hindi/English speech voice.');
     return;
   }
   if (deps.browserSpeak(clean)) {
@@ -510,7 +519,7 @@ export function createSentenceChain(
       // No engine at all: the chain continues (text is on screen) but the UI
       // is TOLD that audio is unavailable instead of pretending to speak.
       callbacks.onVoiceError?.(
-        'Voice unavailable: server TTS failed and this browser has no speechSynthesis.'
+        'Voice unavailable: server TTS failed and this browser has no compatible Hindi/English speech voice.'
       );
     }
   };
@@ -626,13 +635,9 @@ export function useSpeechOutput() {
     const t = setTimeout(() => setSupported(true), 0);
     const pickVoice = () => {
       const voices = window.speechSynthesis.getVoices();
-      // Hindi voice pehle, warna koi bhi Indian-English voice
-      voiceRef.current =
-        voices.find((v) => v.lang === 'hi-IN') ??
-        voices.find((v) => v.lang === 'en-IN') ??
-        voices.find((v) => v.lang.startsWith('hi')) ??
-        voices[0] ??
-        null;
+      // Roman-script Hinglish is best served by Indian English. Never pick
+      // an arbitrary installed voice in an unrelated language.
+      voiceRef.current = pickSpeechVoice(voices);
     };
     pickVoice();
     window.speechSynthesis.onvoiceschanged = pickVoice;
@@ -727,7 +732,7 @@ export function useSpeechOutput() {
             try {
               const utter = new SpeechSynthesisUtterance(t);
               if (voiceRef.current) utter.voice = voiceRef.current;
-              utter.lang = voiceRef.current?.lang ?? 'hi-IN';
+              utter.lang = voiceRef.current?.lang ?? 'en-IN';
               utter.rate = 1;
               utter.pitch = 1;
               utter.onend = () => {
@@ -747,7 +752,7 @@ export function useSpeechOutput() {
               return false;
             }
           },
-          browserSynthAvailable: () => 'speechSynthesis' in window,
+          browserSynthAvailable: () => 'speechSynthesis' in window && Boolean(voiceRef.current),
         },
         setEngine,
         setSpeaking,
@@ -854,7 +859,7 @@ export function useSpeechOutput() {
             try {
               const utter = new SpeechSynthesisUtterance(text);
               if (voiceRef.current) utter.voice = voiceRef.current;
-              utter.lang = voiceRef.current?.lang ?? 'hi-IN';
+              utter.lang = voiceRef.current?.lang ?? 'en-IN';
               utter.rate = 1;
               utter.pitch = 1;
               utter.onend = finish;
@@ -864,7 +869,7 @@ export function useSpeechOutput() {
               finish();
             }
           }),
-        browserSynthAvailable: () => 'speechSynthesis' in window,
+        browserSynthAvailable: () => 'speechSynthesis' in window && Boolean(voiceRef.current),
       },
       {
         onEngine: (e) => {
