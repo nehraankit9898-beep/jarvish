@@ -1,38 +1,16 @@
 import { NextRequest } from 'next/server';
 import { listTools, getTool, hasTool } from '@/lib/agentic/tool-registry';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
-import { registerBrowserTools } from '@/lib/agentic/browser-tools';
-import { registerHostTools } from '@/lib/agentic/host-tools';
-import { registerLaptopTools } from '@/lib/agentic/laptop-tools';
-import { registerMemoryTools } from '@/lib/agentic/memory-tools';
-import { registerRecollectTools } from '@/lib/agentic/recollect-tools';
-import { registerConnectorTools } from '@/lib/agentic/connector-tools';
-import { registerDocumentTools } from '@/lib/agentic/document-tools';
-import { registerInfoTools } from '@/lib/agentic/info-tools';
-import { registerPcTools } from '@/lib/agentic/pc-tools';
-import { loadActiveCustomTools } from '@/lib/agentic/custom-tools';
+import { ensureFullToolCatalog } from '@/lib/agentic/tool-catalog';
 
 export const runtime = 'nodejs';
 
-/** The browser tools + approved custom tools join the built-ins lazily. */
-async function ensureFullCatalog() {
-  registerBrowserTools();
-  registerHostTools();
-  registerLaptopTools();
-  registerMemoryTools();
-  registerRecollectTools();
-  registerConnectorTools();
-  registerDocumentTools();
-  registerInfoTools();
-  registerPcTools();
-  await loadActiveCustomTools().catch(() => 0);
-}
 
 export async function GET(req: NextRequest) {
   const denied = rejectIfUnauthorized(req);
   if (denied) return denied;
   try {
-    await ensureFullCatalog();
+    await ensureFullToolCatalog();
     const tools = listTools();
     return Response.json(tools);
   } catch (err) {

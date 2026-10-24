@@ -18,7 +18,7 @@ import {
 import { recentDownloads } from '@/lib/agentic/downloads';
 import { searchBrowserHistory } from '@/lib/agentic/browser-history';
 import { requestHostAction, hostMode, trustedDirs } from '@/lib/agentic/host-control';
-import { registerLaptopTools } from '@/lib/agentic/laptop-tools';
+import { ensureFullToolCatalog } from '@/lib/agentic/tool-catalog';
 import { connectRealChrome } from '@/lib/agentic/browser/browser-service';
 import { telegramStatus, startTelegramBot, stopTelegramBot } from '@/lib/agentic/telegram-connector';
 import { voiceBridgeStatus, ensureVoiceBridge } from '@/lib/agentic/voice-bridge';
@@ -36,7 +36,7 @@ export async function GET(req: NextRequest) {
   const denied = rejectIfUnauthorized(req);
   if (denied) return denied;
 
-  registerLaptopTools();
+  await ensureFullToolCatalog();
   const kill = getKillState();
 
   return Response.json({

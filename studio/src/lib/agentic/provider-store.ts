@@ -327,7 +327,16 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderDt
   );
   const maxRetries = clampInt(input.maxRetries, existing?.maxRetries ?? 2, 0, MAX_RETRIES);
   const priority = clampInt(input.priority, existing?.priority ?? 100, 0, 10_000);
-  const costClass = inferCostClass(provider, model, input.costClass);
+  // H28: same rule as `model` / `baseUrl` above (M2) — a field that is absent
+  // from the request must KEEP what is stored. Re-inferring it unconditionally
+  // meant that an unrelated partial save (priority reorder, label, enable)
+  // wiped a user's explicit free/paid classification and free-only routing
+  // quietly changed its mind about a provider.
+  const costClass = inferCostClass(
+    provider,
+    model,
+    input.costClass ?? (existing?.costClass as CostClass | undefined)
+  );
 
   const data = {
     label: (input.label ?? existing?.label ?? '').slice(0, 120),
@@ -594,6 +603,12 @@ export async function loadRouterPolicy(): Promise<RouterPolicy> {
     providerOrder: order.filter((o) => o.enabled).map((o) => o.provider),
     disabledProviders: order.filter((o) => !o.enabled).map((o) => o.provider),
     costClassOf: (provider, model) => {
+      // H29: the PER-MODEL marker wins over the provider-level class.
+      // OpenRouter-style `…:free` models are free for this call even though the
+      // provider itself is classified 'paid' — and the provider-level class used
+      // to be returned first, so free-only mode refused exactly the free models
+      // it was configured to use (and 'prefer free first' never moved them up).
+      if (model && /:free$/i.test(String(model).trim())) return 'free';
       const configured = costByProvider.get(provider);
       if (configured && configured !== 'unknown') return configured;
       return inferCostClass(provider, model);

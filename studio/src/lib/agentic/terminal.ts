@@ -73,10 +73,14 @@ export async function executeCommand(
   // Execute the command EXACTLY as given (trimmed) — collapsing whitespace
   // would corrupt quoted arguments like echo "a   b".
   const command = String(rawCommand ?? '').trim();
-  // Classification + approval matching always use the normalized form, so an
-  // approved command is recognised even if the LLM spaced it differently.
   const key = normalizeCommand(command);
-  const check = checkCommand(key);
+  // H7: CLASSIFY THE RAW COMMAND. `normalizeCommand` folds every newline into
+  // a space, so classifying the normalized form hid the fact that
+  // "echo hi\nrm -rf x" is TWO shell commands — the classifier (and the audit
+  // record it feeds) reported the whole payload as the first, harmless line.
+  // The normalized form is still the right key for APPROVAL MATCHING, where
+  // whitespace differences between the LLM and the UI must not matter.
+  const check = checkCommand(command);
   const approved = new Set((opts.approvedCommands ?? []).map(normalizeCommand));
   const approvedRaw = new Set((opts.approvedCommands ?? []).map((c) => String(c ?? '').trim()));
 

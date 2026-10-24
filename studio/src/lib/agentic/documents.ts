@@ -101,15 +101,25 @@ const ENTITIES: Record<string, string> = {
   rdquo: '”',
 };
 
+/**
+ * `String.fromCodePoint` THROWS for anything outside 0 … 0x10FFFF (and a
+ * surrogate half produces invalid UTF-16), so one bogus `&#99999999;` in a
+ * document used to abort the whole extraction with a RangeError instead of
+ * decoding what it could. Out-of-range references are left as literal text.
+ */
+function codePointOr(whole: string, code: number): string {
+  if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole;
+  if (code >= 0xd800 && code <= 0xdfff) return whole; // lone surrogate
+  return String.fromCodePoint(code);
+}
+
 export function decodeXmlEntities(text: string): string {
   return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body: string) => {
     if (body.startsWith('#x') || body.startsWith('#X')) {
-      const code = Number.parseInt(body.slice(2), 16);
-      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : whole;
+      return codePointOr(whole, Number.parseInt(body.slice(2), 16));
     }
     if (body.startsWith('#')) {
-      const code = Number.parseInt(body.slice(1), 10);
-      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : whole;
+      return codePointOr(whole, Number.parseInt(body.slice(1), 10));
     }
     return ENTITIES[body] ?? whole;
   });
@@ -205,6 +215,17 @@ export function readZipEntry(buffer: Buffer, entry: ZipEntry): Buffer {
   const nameLen = buffer.readUInt16LE(lh + 26);
   const extraLen = buffer.readUInt16LE(lh + 28);
   const start = lh + 30 + nameLen + extraLen;
+  // H22: a local header that lies about its name/extra lengths used to slice
+  // PAST the end of the file. `subarray` clamps silently, so a STORED entry
+  // returned an empty or truncated buffer and the caller cheerfully indexed
+  // garbage text as if the document had been read properly. Refuse instead.
+  if (
+    start < 0 ||
+    start > buffer.length ||
+    entry.compressedSize > buffer.length - start
+  ) {
+    throw new DocumentError(`Corrupt zip entry (bad data offset): ${entry.name}`);
+  }
   const data = buffer.subarray(start, start + entry.compressedSize);
   if (entry.method === 0) return Buffer.from(data);
   if (entry.method !== 8) {
@@ -282,11 +303,23 @@ function parseSharedStrings(xml: string): string[] {
   return out;
 }
 
+/**
+ * `A1` → 0, `B7` → 1 … XLSX has at most 16 384 columns (A … XFD).
+ * H24: an out-of-range column letter run used to be returned as-is, and the
+ * caller pads the row with `while (cells.length < at) cells.push('')` — a cell
+ * ref of "AAAAAAAA" (8 billion) or "ZZZZZZ" (≈300 million) in a handcrafted
+ * workbook made the parser allocate until the process died. Anything past the
+ * real grid is skipped by the caller (negative).
+ */
+const MAX_SHEET_COLUMNS = 16_384;
+
 function columnIndex(ref: string): number {
   const letters = /^([A-Z]+)/.exec(ref)?.[1] ?? 'A';
+  if (letters.length > 4) return -1; // cannot be a real column
   let n = 0;
   for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
-  return n - 1;
+  const index = n - 1;
+  return index >= MAX_SHEET_COLUMNS ? -1 : index;
 }
 
 /** One sheet's XML → rows of cell strings (shared strings resolved). */
@@ -315,6 +348,7 @@ export function parseSheetXml(xml: string, shared: string[]): string[][] {
         value = decodeXmlEntities(/<v>([\s\S]*?)<\/v>/.exec(body)?.[1] ?? '');
       }
       const at = ref ? columnIndex(ref) : cells.length;
+      if (at < 0) continue; // beyond the sheet grid — not addressable anyway
       while (cells.length < at) cells.push('');
       cells[at] = value;
     }
@@ -522,7 +556,13 @@ function decodePdfHex(hex: string): string {
  */
 export function pdfContentToText(content: string): string {
   let out = '';
-  const re = /\((?:\\.|[^\\()])*\)\s*(Tj|')|<([0-9a-fA-F\s]+)>\s*Tj|\[((?:[^\[\]]|\\.)*)\]\s*TJ|(T\*)|(Td|TD)|(ET)/g;
+  // H25: the TJ-array group used to be `((?:[^\[\]]|\\.)*)`. Both branches can
+  // match a backslash, so a stream full of backslashes with no closing `]`
+  // sent the engine into exponential backtracking (a "regex bomb" inside a
+  // PDF froze the request thread). The branches are now DISJOINT — a
+  // non-backslash character, or a backslash plus one — which makes the scan
+  // linear, and the whole thing is capped below.
+  const re = /\((?:\\.|[^\\()])*\)\s*(Tj|')|<([0-9a-fA-F\s]+)>\s*Tj|\[((?:[^\\\]]|\\.)*)\]\s*TJ|(T\*)|(Td|TD)|(ET)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content)) !== null) {
     if (m[1] === 'Tj' || m[1] === "'") {

@@ -28,6 +28,8 @@ import { downloadsDir } from './allowed-roots';
 export { downloadsDir };
 
 const MAX_DOWNLOAD_BYTES_DEFAULT = 200 * 1024 * 1024; // 200 MB
+/** how long a download may go without a single new byte before it is aborted */
+const DOWNLOAD_STALL_MS = 120_000;
 const WATCH_INTERVAL_MS = 20_000;
 const MAX_WATCH_FILES = 400;
 
@@ -130,7 +132,7 @@ export async function downloadToDownloads(
   fs.mkdirSync(dir, { recursive: true });
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120_000);
+  let timeout = setTimeout(() => controller.abort(), DOWNLOAD_STALL_MS);
   let res: Response | null = null;
   try {
     // redirects are followed MANUALLY so every hop passes the same SSRF
@@ -161,7 +163,15 @@ export async function downloadToDownloads(
     clearTimeout(timeout);
     throw new DownloadError(`Download failed: ${err instanceof Error ? err.message : 'network error'}`);
   }
-  clearTimeout(timeout);
+  // H17: the timer used to be cancelled right here — as soon as the HEADERS
+  // arrived. A server that answers instantly and then trickles the body one
+  // byte a minute therefore kept the request (and the agent task waiting on
+  // it) alive forever, past any size cap. From here the timer is a STALL
+  // timeout that is re-armed on every chunk until the file is on disk.
+  const armTimeout = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), DOWNLOAD_STALL_MS);
+  };
 
   // the `if (!res) throw` inside the try guarantees non-null here; the local
   // just gives TypeScript the same certainty
@@ -191,6 +201,7 @@ export async function downloadToDownloads(
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        armTimeout();
         written += value.byteLength;
         if (written > cap) throw new DownloadError(`Download exceeded the size limit mid-stream (${Math.round(cap / 1048576)} MB)`);
         fs.writeSync(fd, value);
@@ -206,7 +217,14 @@ export async function downloadToDownloads(
       /* ignore */
     }
     if (err instanceof DownloadError) throw err;
-    throw new DownloadError(`Download failed: ${err instanceof Error ? err.message : 'unknown'}`);
+    const aborted = (err as Error)?.name === 'AbortError';
+    throw new DownloadError(
+      aborted
+        ? `Download stalled — no data for ${DOWNLOAD_STALL_MS / 1000}s`
+        : `Download failed: ${err instanceof Error ? err.message : 'unknown'}`
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 
   const result: DownloadResult = {
@@ -251,8 +269,15 @@ function watchStore(): WatchState {
   return (g.__downloadsWatch ??= { timer: null, known: new Map(), lastTick: 0, paused: false });
 }
 
-/** Scan once: any file NEWER than the previous scan (and not seen before) notifies. */
-export function scanDownloadsOnce(now = Date.now()): Array<{ name: string; path: string; size: number }> {
+/**
+ * Scan once: any file NEWER than the previous scan (and not seen before)
+ * notifies. `silent` records what is there WITHOUT notifying — used for the
+ * seeding pass at startup.
+ */
+export function scanDownloadsOnce(
+  now = Date.now(),
+  opts: { silent?: boolean } = {}
+): Array<{ name: string; path: string; size: number }> {
   const state = watchStore();
   if (state.paused) return [];
   const dir = downloadsDir();
@@ -306,7 +331,13 @@ export function scanDownloadsOnce(now = Date.now()): Array<{ name: string; path:
   }
   state.lastTick = now;
 
-  if (fresh.length) {
+  // H18: the "seed without notifying" pass used to notify anyway — any file
+  // the user had touched in the last ten minutes produced a phantom
+  // "New file in Downloads" on EVERY server restart, because the freshness
+  // window inside the scan is what decides. Under `silent` the scan still
+  // records the known-set (so the next real tick sees nothing new) but stays
+  // quiet.
+  if (fresh.length && !opts.silent) {
     void createNotification({
       type: 'download',
       title: fresh.length === 1 ? `New file in Downloads: ${fresh[0].name}` : `${fresh.length} new files in Downloads`,
@@ -330,7 +361,7 @@ export function startDownloadsWatcher(): boolean {
     }
   }, WATCH_INTERVAL_MS);
   // seed the known-set without notifying about the existing content
-  scanDownloadsOnce(Date.now());
+  scanDownloadsOnce(Date.now(), { silent: true });
   return true;
 }
 

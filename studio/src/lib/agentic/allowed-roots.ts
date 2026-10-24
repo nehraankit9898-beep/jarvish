@@ -134,6 +134,9 @@ export function listTreeUnderRoot(target: string, maxDepth = 3): {
         }
       }
       entries.push({ name: e.name, path: full, type, size, depth: level });
+      // NB: a symlink reports as `other` here (Dirent of a link is not
+      // `isDirectory()`), so a link planted inside a root is listed but never
+      // walked into — the tree cannot be used to roam outside the root.
       if (type === 'dir' && level + 1 < depth) walk(full, level + 1);
       if (entries.length >= MAX_TREE_ENTRIES) return;
     }

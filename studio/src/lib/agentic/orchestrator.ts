@@ -44,7 +44,9 @@ import {
   checkDependencies,
   detectCycles,
   isReadOnlyKind,
+  planIndexes,
   planParallelism,
+  sanitizeStepDependencies,
   topologicalOrder,
   WorkspaceLock,
   WriteConflictError,
@@ -535,7 +537,11 @@ Create the plan JSON now. Each step may list "dependencies" (other steps this st
   }
 
   const plan = buildPlanParse(reply);
-  let bounded = plan.steps.slice(0, mergedConfig.maxSteps!);
+  // H5: the planner validated its dependency indexes against ITS step count.
+  // Truncating to maxSteps afterwards can drop a step that other steps still
+  // reference, and a dangling reference parks the dependent step forever (it
+  // is silently skipped while the task reports done), so re-validate here.
+  let bounded = sanitizeStepDependencies(plan.steps.slice(0, mergedConfig.maxSteps!));
 
   // ---- plan-gap detection (Feature 10) ----
   // The plan is verified against the task's intent with deterministic rules
@@ -567,7 +573,10 @@ steps). Keep the same JSON shape.`,
         router
       );
       const revisedPlan = buildPlanParse(revised.text);
-      const revisedBounded = revisedPlan.steps.slice(0, mergedConfig.maxSteps!);
+      // H5: same re-validation for the revised plan (it is truncated as well)
+      const revisedBounded = sanitizeStepDependencies(
+        revisedPlan.steps.slice(0, mergedConfig.maxSteps!)
+      );
       const revisedGaps = detectPlanGaps(task.prompt, revisedBounded);
       // accept the revision only when it actually IMPROVED the plan
       if (revisedGaps.filter((g) => g.severity === 'critical').length <
@@ -1236,7 +1245,10 @@ export async function runTask(
     });
   }
 
-  const planSteps = JSON.parse(task.plan || '[]') as PlanStep[];
+  // H5: a plan stored before the dependency re-validation (or hand-edited
+  // through the API) can still carry references to steps that do not exist —
+  // sanitize on the way in as well, so no step is parked behind a phantom.
+  const planSteps = sanitizeStepDependencies(JSON.parse(task.plan || '[]') as PlanStep[]);
   if (!planSteps.length) {
     await emit.drain();
     throw new Error('Plan missing — pehle plan approve karo');
@@ -1433,7 +1445,7 @@ export async function runTask(
 
     // ---- dependency check ----
     const statuses = await statusOf();
-    const deps = checkDependencies(planStep, statuses);
+    const deps = checkDependencies(planStep, statuses, planIndexes(planSteps));
     if (!deps.satisfied) {
       if (deps.broken.length === 0 && deps.pending.length > 0) {
         // A dependency is merely PENDING — with the parallel runner it may
@@ -1643,7 +1655,7 @@ export async function runTask(
   const stillRunnable = planSteps.filter((s) => {
     const st = statusesNow.get(s.index);
     if (st && st !== 'pending' && st !== 'paused') return false;
-    return checkDependencies(s, statusesNow).satisfied;
+    return checkDependencies(s, statusesNow, planIndexes(planSteps)).satisfied;
   });
   if (stillRunnable.length) {
     await emit.drain();
@@ -1847,18 +1859,18 @@ async function executeStep(params: {
             });
             await stepLog(step.id, 'file', `${c.action}: ${c.path} (${c.bytes} bytes)`);
           }
+          // H31: this used to re-read `step.filesChanged` — the snapshot the
+          // step had when it was LOADED — so every retry overwrote the list and
+          // the files written by the earlier attempts disappeared from the
+          // record (the "Files:" line the coder hands to the tester, the UI
+          // summary, and the diff view all lost them). The accumulator above is
+          // exactly what this needs: update it, persist it.
+          for (const c of changes) {
+            if (!filesChanged.includes(c.path)) filesChanged.push(c.path);
+          }
           await db.agenticStep.update({
             where: { id: step.id },
-            data: {
-              filesChanged: JSON.stringify(
-                Array.from(
-                  new Set([
-                    ...(JSON.parse(step.filesChanged || '[]') as string[]),
-                    ...changes.map((c) => c.path),
-                  ])
-                )
-              ),
-            },
+            data: { filesChanged: JSON.stringify(filesChanged) },
           });
         }
       }

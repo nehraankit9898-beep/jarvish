@@ -398,6 +398,13 @@ export async function getDocument(id: string): Promise<KnowledgeDocDto | null> {
 
 /** Remove a document and its chunks. */
 export async function deleteDocument(id: string): Promise<boolean> {
+  // H21: the schema declares `onDelete: Cascade`, but a cascade only fires when
+  // the connection has `PRAGMA foreign_keys = ON` — and that is per-connection,
+  // not a property of the file. Relying on it meant the FULL TEXT of a document
+  // the user explicitly deleted could stay in SQLite forever (chunk rows are
+  // never referenced again, so nothing ever showed it and nothing ever
+  // removed it). project-index.ts already deletes chunks by hand; same here.
+  await db.knowledgeChunk.deleteMany({ where: { docId: id } });
   const res = await db.knowledgeDoc.deleteMany({ where: { id } });
   return res.count > 0;
 }

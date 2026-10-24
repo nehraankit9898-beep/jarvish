@@ -159,7 +159,7 @@ export async function ensureVoiceBridge(): Promise<VoiceProc | null> {
         child = spawn(python, [
           voiceScript(),
           '--port', String(voicePort()),
-          '--token', desktopToken(),
+          // H33: no secret in argv (world-readable via ps) — see desktop-bridge.
           '--kill-flag', killFlagFile(),
           '--state-dir', path.join(process.cwd(), 'db'),
         ], { env: bridgeEnv(), shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -324,9 +324,9 @@ export async function voiceCall(
   }
 
   const url = `http://127.0.0.1:${voicePort()}${endpoint}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
     // The caller's abort (e.g. user interrupted speech) wins over the timeout.
     const signal = opts.signal
       ? AbortSignal.any([controller.signal, opts.signal])
@@ -340,7 +340,6 @@ export async function voiceCall(
       body: endpoint === '/ping' || endpoint === '/status' ? undefined : JSON.stringify(payload),
       signal,
     });
-    clearTimeout(timeout);
 
     if (opts.raw && res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
@@ -360,6 +359,10 @@ export async function voiceCall(
   } catch (err) {
     const message = err instanceof Error ? err.message : 'voice bridge call failed';
     return { ok: false, error: `Voice bridge unreachable: ${message}` };
+  } finally {
+    // H34: cover the BODY, not just the headers — a TTS stream that stalls
+    // after the response started used to hang this call forever.
+    clearTimeout(timeout);
   }
 }
 
