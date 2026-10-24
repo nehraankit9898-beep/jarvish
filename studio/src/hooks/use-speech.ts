@@ -231,7 +231,13 @@ export async function runSpeechChain(
   isCurrent: () => boolean,
   deps: SpeechChainDeps,
   onEngine: (engine: SpeechEngine) => void,
-  onSpeaking: (speaking: boolean) => void
+  onSpeaking: (speaking: boolean) => void,
+  /**
+   * Called when NO voice engine could speak. Speech failures used to be
+   * swallowed (the UI simply showed "speaking" and stopped), so the user had
+   * no idea the assistant was silent — spec §6 requires a visible error.
+   */
+  onError?: (message: string) => void
 ): Promise<void> {
   // 1) natural voice try karo (python voice bridge, edge-tts)
   try {
@@ -261,12 +267,14 @@ export async function runSpeechChain(
   //    natural, par offline + zero-setup)
   if (!deps.browserSynthAvailable()) {
     onSpeaking(false);
+    onError?.('Voice unavailable: the server voice bridge is not running and this browser has no speechSynthesis.');
     return;
   }
   if (deps.browserSpeak(clean)) {
     onEngine('browser'); // onended/onerror handlers end the state
   } else {
     onSpeaking(false);
+    onError?.('Voice unavailable: the browser refused to start speech synthesis.');
   }
 }
 
@@ -407,6 +415,8 @@ export function createSentenceChain(
     onSettled: () => void;
     /** called once when the first sentence starts playing (perf mark) */
     onFirstAudio?: () => void;
+    /** called once when a sentence could not be spoken by ANY engine */
+    onVoiceError?: (message: string) => void;
   }
 ): SentenceChain {
   let buffer = '';
@@ -496,8 +506,13 @@ export function createSentenceChain(
     } else if (deps.browserSynthAvailable()) {
       callbacks.onEngine('browser');
       await deps.browserSpeakToEnd(sentence, isCurrent);
+    } else {
+      // No engine at all: the chain continues (text is on screen) but the UI
+      // is TOLD that audio is unavailable instead of pretending to speak.
+      callbacks.onVoiceError?.(
+        'Voice unavailable: server TTS failed and this browser has no speechSynthesis.'
+      );
     }
-    // else: no engine at all — skip silently, the chain continues
   };
 
   const pump = () => {
@@ -558,11 +573,22 @@ export function createSentenceChain(
   };
 }
 
+const TTS_PREF_KEY = 'agentscope-tts-enabled';
+
+/**
+ * JARVIS is a VOICE assistant: speech is ON by default when the browser can
+ * speak at all, and the user's choice is remembered. It used to default to
+ * OFF, which is why "JARVIS often does not speak" — unless the user found the
+ * speaker toggle, every action was silent.
+ */
 export function useSpeechOutput() {
   const [supported, setSupported] = useState(false);
   const [speaking, setSpeaking] = useState(false);
-  const [enabled, setEnabled] = useState(false); // off by default — the user opts in
+  const [enabled, setEnabledState] = useState(true);
   const [engine, setEngine] = useState<SpeechEngine | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  /** the last sentence JARVIS actually tried to say (visible transcript) */
+  const [lastSpoken, setLastSpoken] = useState<string>('');
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const seqRef = useRef(0); // a stale audio response never starts after a stop()
@@ -572,6 +598,27 @@ export function useSpeechOutput() {
   useEffect(() => {
     enabledRef.current = enabled;
   }, [enabled]);
+
+  // hydrate the saved preference (default ON)
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(TTS_PREF_KEY);
+      if (saved === '0') setEnabledState(false);
+      if (saved === '1') setEnabledState(true);
+    } catch {
+      /* private mode — keep the default */
+    }
+  }, []);
+
+  const setEnabled = useCallback((next: boolean) => {
+    setEnabledState(next);
+    try {
+      window.localStorage.setItem(TTS_PREF_KEY, next ? '1' : '0');
+    } catch {
+      /* private mode */
+    }
+    if (!next) setError(null);
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -623,12 +670,23 @@ export function useSpeechOutput() {
     setSpeaking(false);
   }, []);
 
-  const speak = useCallback(
-    (text: string) => {
-      if (!enabled || typeof window === 'undefined') return;
+  /**
+   * Speak one complete text (used for acknowledgements, final statuses,
+   * settings confirmations). Returns TRUE when an engine took the job.
+   *
+   * `force` is for the explicit "Test voice" button and for the guaranteed
+   * final status of an action: the user asked for audio, so a muted toggle
+   * must not turn the button into a no-op that looks broken.
+   */
+  const speakNow = useCallback(
+    (text: string, force = false): boolean => {
+      if (typeof window === 'undefined') return false;
+      if (!enabled && !force) return false;
       const clean = speechFriendly(text);
-      if (!clean) return;
-      stopSpeaking(); // queue me purana padha na jaye
+      if (!clean) return false;
+      stopSpeaking(); // never overlap two utterances
+      setError(null);
+      setLastSpoken(clean);
       const seq = ++seqRef.current;
       setSpeaking(true);
       const isCurrent = () => seq === seqRef.current;
@@ -651,7 +709,12 @@ export function useSpeechOutput() {
                 }
               };
               audio.onerror = () => {
-                if (isCurrent()) setSpeaking(false);
+                if (isCurrent()) {
+                  // media element failed AFTER the bytes arrived — surface it,
+                  // the browser voice is still tried below by the chain? No:
+                  // this rejects so the chain falls back.
+                  setError('Audio playback failed — using the browser voice instead.');
+                }
                 try {
                   URL.revokeObjectURL(audio.src);
                 } catch {
@@ -670,8 +733,13 @@ export function useSpeechOutput() {
               utter.onend = () => {
                 if (isCurrent()) setSpeaking(false);
               };
-              utter.onerror = () => {
-                if (isCurrent()) setSpeaking(false);
+              utter.onerror = (event) => {
+                if (isCurrent()) {
+                  setSpeaking(false);
+                  setError(
+                    `Voice error: ${String((event as { error?: string })?.error ?? 'speech synthesis failed')}`
+                  );
+                }
               };
               window.speechSynthesis.speak(utter);
               return true;
@@ -682,10 +750,33 @@ export function useSpeechOutput() {
           browserSynthAvailable: () => 'speechSynthesis' in window,
         },
         setEngine,
-        setSpeaking
+        setSpeaking,
+        (message) => {
+          if (isCurrent()) setError(message);
+        }
       );
+      return true;
     },
     [enabled, stopSpeaking]
+  );
+
+  /** The normal path (respects the mute toggle). */
+  const speak = useCallback((text: string) => speakNow(text, false), [speakNow]);
+
+  /**
+   * "Test voice" — ALWAYS produces audio (or an explicit error), even when
+   * the toggle is off. Previously the settings button called `speak()`, which
+   * returned immediately while muted: the button looked broken.
+   */
+  const testVoice = useCallback(
+    (text = 'All systems online. Main aapki awaaz sun raha hoon.') => {
+      const started = speakNow(text, true);
+      if (!started) {
+        setError('Voice unavailable: this browser cannot synthesise speech.');
+      }
+      return started;
+    },
+    [speakNow]
   );
 
   /**
@@ -701,6 +792,7 @@ export function useSpeechOutput() {
     const seq = ++seqRef.current;
     const sessionStart = Date.now();
     setSpeaking(true); // stays true until the session settles (blocks LIVE mic)
+    setError(null);
     const isCurrent = () => seq === seqRef.current;
 
     const chain = createSentenceChain(
@@ -785,6 +877,9 @@ export function useSpeechOutput() {
         onFirstAudio: () => {
           if (isCurrent()) perfSample('tts.firstAudio', Date.now() - sessionStart);
         },
+        onVoiceError: (message) => {
+          if (isCurrent()) setError(message);
+        },
       }
     );
     streamChainRef.current = chain;
@@ -802,7 +897,23 @@ export function useSpeechOutput() {
     };
   }, [stopSpeaking]);
 
-  return { supported, enabled, setEnabled, speaking, speak, stopSpeaking, engine, startStreamSpeak };
+  return {
+    supported,
+    enabled,
+    setEnabled,
+    speaking,
+    speak,
+    speakEssential: (text: string) => speakNow(text, true),
+    testVoice,
+    stopSpeaking,
+    engine,
+    /** visible voice problem (engine down, playback refused, ...) */
+    error,
+    clearError: () => setError(null),
+    /** transcript of the last sentence JARVIS said */
+    lastSpoken,
+    startStreamSpeak,
+  };
 }
 
 // ---------- wake word ("Hey Jarvis") — Jarvis #1 ----------

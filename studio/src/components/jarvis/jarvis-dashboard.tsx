@@ -70,6 +70,9 @@ export interface JarvisDashboardProps {
   onStop: () => void;
   voice: Voice;
   tts: Tts;
+  /** visible speech problem (engine down / playback refused) — spec §6 */
+  voiceError?: string | null;
+  onDismissVoiceError?: () => void;
   handsFree: boolean;
   toggleHandsFree: () => void;
   micLang: VoiceLang;
@@ -225,6 +228,8 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
     onStop,
     voice,
     tts,
+    voiceError,
+    onDismissVoiceError,
     handsFree,
     toggleHandsFree,
     micLang,
@@ -948,6 +953,34 @@ export function JarvisDashboard(props: JarvisDashboardProps) {
                   ? 'LIVE: continuous listen → think → speak loop'
                   : 'routed by the Jarvis intent engine · chat or agentic task'}
             </p>
+            {/* SPEAKING INDICATOR + transcript of what the voice said */}
+            {tts.speaking && (
+              <p className="mt-1 text-[10px] text-cyan-300/80 font-mono truncate">
+                <Volume2 className="h-3 w-3 inline mr-1" />
+                {tts.lastSpoken ? `speaking: ${tts.lastSpoken}` : 'speaking…'}
+              </p>
+            )}
+            {/* A voice failure is NEVER silent: engine down, playback refused,
+                or a browser without speechSynthesis all land here. */}
+            {(voiceError || !tts.supported) && (
+              <div className="mt-1.5 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200">
+                <VolumeX className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                <span className="flex-1 break-words">
+                  {voiceError ??
+                    'Voice unavailable in this browser — replies are text only. Chrome/Edge support speech synthesis.'}
+                </span>
+                {onDismissVoiceError && voiceError && (
+                  <button
+                    type="button"
+                    onClick={onDismissVoiceError}
+                    className="underline shrink-0"
+                    aria-label="Dismiss voice error"
+                  >
+                    dismiss
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

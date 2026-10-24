@@ -3,7 +3,8 @@ import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { recordAudit, clientIp } from '@/lib/agentic/audit';
 import { getProvider } from '@/lib/providers';
 import { testProviderConnection } from '@/lib/agentic/provider-connection';
-import { effectiveCredential } from '@/lib/agentic/provider-store';
+import { effectiveCredential, recordConnectionResult } from '@/lib/agentic/provider-store';
+import { recordLastError } from '@/lib/agentic/last-action-error';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -92,6 +93,20 @@ export async function POST(
       model: asString(body.model),
     });
 
+    // Persist the REAL result so the panel's "verified" badge is based on a
+    // test that actually ran (it used to be stored nowhere).
+    await recordConnectionResult(providerId, result.ok, result.error ?? '').catch(
+      () => undefined
+    );
+    if (!result.ok) {
+      recordLastError({
+        what: `${info.name} connection test`,
+        category: String(result.errorCategory ?? 'unknown'),
+        message: result.error ?? '',
+        hint: result.hint,
+        secrets: asString(body.apiKey) ? [asString(body.apiKey) as string] : [],
+      });
+    }
     await recordAudit({
       actor: 'user',
       action: 'provider.test',
@@ -110,6 +125,13 @@ export async function POST(
     return Response.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Connection failed';
+    await recordConnectionResult(providerId, false, message).catch(() => undefined);
+    recordLastError({
+      what: `${info.name} connection test`,
+      category: 'unknown',
+      message,
+      secrets: asString(body.apiKey) ? [asString(body.apiKey) as string] : [],
+    });
     await recordAudit({
       actor: 'user',
       action: 'provider.test',

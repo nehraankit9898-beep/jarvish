@@ -25,7 +25,17 @@ export interface ProviderInfo {
   kind: ProviderKind;
   baseUrl: string;
   defaultModel: string;
+  /**
+   * OFFLINE FALLBACK catalogue only. The authoritative list comes from the
+   * provider (GET /models) through /api/providers/[id]/models — this array is
+   * used when the provider cannot be reached and is always labelled as such
+   * in the UI (`source: 'catalog'`), never presented as a live result.
+   */
   models: string[];
+  /** subset of `models` that the provider may have retired for new keys */
+  legacyModels?: string[];
+  /** per-model caveats shown next to the model in the UI */
+  modelNotes?: Record<string, string>;
   keyLabel: string;
   keyUrl: string;
   free: boolean;
@@ -89,14 +99,38 @@ export const PROVIDERS: ProviderInfo[] = [
     name: 'Google Gemini',
     emoji: '💎',
     kind: 'gemini',
+    // v1beta + `x-goog-api-key` header. The key is NEVER put in the query
+    // string (it leaks into proxy logs and browser history).
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    // Default = a STABLE chat model that supports generateContent.
+    // The live catalogue (GET /v1beta/models) replaces this list after a
+    // successful "Refresh models"; this is only the offline fallback.
     defaultModel: 'gemini-3.8-flash',
-    models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-4-argon', 'gemini-2.5-flash', 'gemini-2.5-pro'],
+    models: [
+      'gemini-3.8-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-4-argon',
+      'gemini-flash-latest',
+      'gemini-pro-latest',
+      'gemini-3.1-pro-preview',
+      // legacy: only usable by projects that already used the 2.5 family
+      'gemini-2.5-flash',
+      'gemini-2.5-pro',
+    ],
+    legacyModels: ['gemini-2.5-flash', 'gemini-2.5-pro'],
+    modelNotes: {
+      'gemini-2.5-flash': 'Legacy — Google limits the 2.5 family to projects that used it before 2026-09-18.',
+      'gemini-2.5-pro': 'Legacy — Google limits the 2.5 family to projects that used it before 2026-09-18.',
+      'gemini-3.1-pro-preview': 'Preview model — may be replaced by Google.',
+      'gemini-flash-latest': 'Alias — always points at the current Flash model.',
+      'gemini-pro-latest': 'Alias — always points at the current Pro model.',
+    },
     keyLabel: 'AIza...',
     keyUrl: 'https://aistudio.google.com/apikey',
     free: false,
     description: 'Gemini models — generous free tier available.',
-    docsNote: 'Free key from aistudio.google.com',
+    docsNote:
+      'Key from aistudio.google.com. Models are verified against GET /v1beta/models (only generateContent-capable models are listed).',
   },
   {
     id: 'deepseek',
@@ -174,20 +208,30 @@ export const PROVIDERS: ProviderInfo[] = [
     emoji: '🌐',
     kind: 'openai-compatible',
     baseUrl: 'https://openrouter.ai/api/v1',
-    defaultModel: 'google/gemini-2.5-flash-preview-05-20:free',
+    // `openrouter/free` is OpenRouter's own free-model router: it picks a
+    // free model for the request instead of pinning one that may be retired
+    // next week (every other `:free` id rotates regularly). The live
+    // /api/v1/models list replaces this fallback after "Refresh models".
+    defaultModel: 'openrouter/free',
     models: [
-      'google/gemini-2.5-flash-preview-05-20:free',
-      'deepseek/deepseek-chat-v3-0324:free',
-      'meta-llama/llama-4-maverick:free',
-      'mistralai/mistral-small-3.1-24b-instruct:free',
-      'moonshotai/kimi-k2:free',
-      'google/gemma-3-27b-it:free',
+      'openrouter/free',
+      'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'nvidia/nemotron-3-super-120b-a12b:free',
+      'google/gemma-4-31b-it:free',
+      'google/gemma-4-26b-a4b-it:free',
+      'qwen/qwen3.8-27b:free',
+      'cohere/north-mini-code:free',
+      'openai/gpt-oss-120b:free',
     ],
+    modelNotes: {
+      'openrouter/free': 'Free router — OpenRouter itself picks an available free model (never a paid one).',
+    },
     keyLabel: 'sk-or-v1-...',
-    keyUrl: 'https://www.openrouter.ai/keys',
+    keyUrl: 'https://openrouter.ai/keys',
     free: true,
     description: 'Unified API for many models with generous free tiers.',
-    docsNote: 'Free models use :free suffix. Paid models can be disabled in Free-only mode.',
+    docsNote:
+      'Free models end in ":free" (also included: the openrouter/free router). Paid models are never selected automatically — free-only mode refuses anything without the suffix.',
   },
   {
     id: 'groq',
@@ -237,36 +281,90 @@ export function getProvider(id: string): ProviderInfo | undefined {
   return PROVIDERS.find((p) => p.id === id);
 }
 
-// Retired/deprecated models → recommended replacement.
-// Google ne gemini-2.0-flash (aur us family) ko shutdown kar diya hai, isliye
-// purane saved configs (localStorage/DB) ko bina manual edit ke naye model par
-// map karte hain — warna API 404 deti hai.
+// Retired/deprecated model ids → the replacement to OFFER.
+//
+// IMPORTANT (spec §5): a different model is never substituted SILENTLY. The
+// resolver returns the replacement together with a `notice`, and every caller
+// (chat, connection test, agentic engine) surfaces that notice to the UI and
+// to the voice. A model that is merely legacy (still served for old projects)
+// is NOT rewritten — the provider's own 404 is reported instead.
 const RETIRED_MODELS: Record<string, string> = {
+  // Gemini 2.0 family — shut down by Google (404 for every project)
   'gemini-2.0-flash': 'gemini-3.8-flash',
+  'gemini-2.0-flash-001': 'gemini-3.8-flash',
   'gemini-2.0-flash-lite': 'gemini-3.8-flash',
+  'gemini-2.0-flash-lite-001': 'gemini-3.8-flash',
+  'gemini-2.0-pro-exp': 'gemini-3.8-flash',
+  // Gemini 1.5 family — shut down
   'gemini-1.5-pro': 'gemini-3.8-flash',
+  'gemini-1.5-pro-latest': 'gemini-3.8-flash',
   'gemini-1.5-flash': 'gemini-3.8-flash',
   'gemini-1.5-flash-latest': 'gemini-3.8-flash',
-  'gemini-1.5-pro-latest': 'gemini-3.8-flash',
+  'gemini-1.5-flash-8b': 'gemini-3.8-flash',
 };
+
+export interface ModelNotice {
+  /** the model that was stored/requested */
+  from: string;
+  /** the model that will actually be used */
+  to: string;
+  reason: string;
+}
+
+export interface ResolvedModel {
+  model: string;
+  /** present when the requested model had to be replaced — MUST be reported */
+  notice?: ModelNotice;
+}
+
+/**
+ * Resolve the model plus an explicit notice when a retired id was replaced.
+ * `resolveModel()` stays as the string-only convenience wrapper.
+ */
+export function resolveModelWithNotice(
+  provider: ProviderInfo | undefined,
+  model?: string
+): ResolvedModel {
+  const base = model?.trim() || provider?.defaultModel || '';
+  if (!base) return { model: provider?.defaultModel || '' };
+  // Only Gemini has the retirement table (its ids are versioned by Google).
+  if (provider && provider.kind !== 'gemini') return { model: base };
+  const replacement = RETIRED_MODELS[base];
+  if (!replacement) return { model: base };
+  return {
+    model: replacement,
+    notice: {
+      from: base,
+      to: replacement,
+      reason: `"${base}" has been shut down by Google; using "${replacement}" instead.`,
+    },
+  };
+}
 
 /**
  * Resolve the model that should actually be used for a provider:
  * - empty/missing → provider.defaultModel
- * - retired model (e.g. gemini-2.0-flash) → its recommended replacement
+ * - retired model (e.g. gemini-2.0-flash) → its replacement (WITH a notice —
+ *   see resolveModelWithNotice)
  * - anything else (incl. custom/preview models) → unchanged
- *
- * Ye helper chat/compare/test-connection/agentic paths sab me use hota hai,
- * taaki koi bhi purana saved model 404 na de.
  */
 export function resolveModel(
   provider: ProviderInfo | undefined,
   model?: string
 ): string {
-  const base = model?.trim() || provider?.defaultModel || '';
-  if (!base) return provider?.defaultModel || '';
-  // Alias sirf Gemini endpoints par lagao — custom/ollama providers ke
-  // model names ko touch mat karo (unka model independent ho sakta hai)
-  if (provider && provider.kind !== 'gemini') return base;
-  return RETIRED_MODELS[base] ?? base;
+  return resolveModelWithNotice(provider, model).model;
+}
+
+/** Is this model marked legacy for the provider (may 404 for new keys)? */
+export function isLegacyModel(provider: ProviderInfo | undefined, model: string): boolean {
+  return Boolean(provider?.legacyModels?.includes(model.trim()));
+}
+
+/** The caveat shown under a model in the picker, when there is one. */
+export function modelNote(
+  provider: ProviderInfo | undefined,
+  model: string
+): string | undefined {
+  if (!provider) return undefined;
+  return provider.modelNotes?.[model.trim()];
 }

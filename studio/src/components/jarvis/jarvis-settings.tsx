@@ -40,10 +40,8 @@ import {
 } from '@/components/ui/select';
 import { toast } from '@/hooks/use-toast';
 import { PROVIDERS, getProvider, type ProviderId } from '@/lib/providers';
-import type {
-  ConnectionConfig,
-  ConnectionsMap,
-} from '@/lib/api-keys-store';
+import { isVerified } from '@/lib/api-keys-store';
+import type { ConnectionConfig, ConnectionsMap } from '@/lib/api-keys-store';
 import type { useVoiceInput, useSpeechOutput, useWakeWord, VoiceLang } from '@/hooks/use-speech';
 import { ShieldCheck, Volume2, Radar, Route, ExternalLink } from 'lucide-react';
 
@@ -101,6 +99,9 @@ export function JarvisSettings(props: JarvisSettingsProps) {
     wakeError,
     onOpenProvidersPanel,
   } = props;
+
+  /* ---------- voice-test feedback ---------- */
+  const [voiceTest, setVoiceTest] = useState<'idle' | 'started' | 'failed'>('idle');
 
   /* ---------- AI BRAIN state ---------- */
   const [selProvider, setSelProvider] = useState<ProviderId>(activeProvider);
@@ -254,7 +255,7 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                   >
                     <span>{p.emoji}</span>
                     <span className="truncate flex-1">{p.name}</span>
-                    {(c?.connected || p.kind === 'zai' || p.id === 'ollama') && (
+                    {(isVerified(c) || p.kind === 'zai' || p.id === 'ollama') && (
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" aria-label="connected" />
                     )}
                     {p.free && (
@@ -272,8 +273,21 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                     <p className="text-sm font-medium text-zinc-100">{selInfo.emoji} {selInfo.name}</p>
                     <p className="text-[11px] text-zinc-500">{selInfo.description}</p>
                   </div>
-                  <Badge variant="outline" className={`text-[10px] ${selConn?.connected ? 'border-emerald-500/40 text-emerald-300' : 'border-zinc-700 text-zinc-500'}`}>
-                    {selConn?.connected ? 'connected' : 'not configured'}
+                  <Badge
+                    variant="outline"
+                    className={`text-[10px] ${
+                      isVerified(selConn)
+                        ? 'border-emerald-500/40 text-emerald-300'
+                        : selConn
+                          ? 'border-amber-500/40 text-amber-300'
+                          : 'border-zinc-700 text-zinc-500'
+                    }`}
+                  >
+                    {isVerified(selConn)
+                      ? 'connected'
+                      : selConn
+                        ? 'configured — not verified'
+                        : 'not configured'}
                   </Badge>
                 </div>
 
@@ -412,13 +426,50 @@ export function JarvisSettings(props: JarvisSettingsProps) {
                   size="sm"
                   variant="outline"
                   className="h-8 border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/10"
-                  disabled={!tts.supported}
-                  onClick={() => tts.speak('All systems online. I am listening.')}
+                  onClick={() => {
+                    // testVoice() bypasses the mute toggle and surfaces failures
+                    // through tts.error — it never silently does nothing.
+                    const started = tts.testVoice('All systems online. Main aapki awaaz sun raha hoon.');
+                    setVoiceTest(started ? 'started' : 'failed');
+                  }}
                 >
                   <Volume2 className="h-3.5 w-3.5 mr-1.5" /> Test voice
                 </Button>
-                {tts.speaking && <span className="text-[10px] font-mono text-cyan-300 jv-anim-blink">speaking…</span>}
+                {tts.speaking && (
+                  <span className="text-[10px] font-mono text-cyan-300 jv-anim-blink">speaking…</span>
+                )}
+                {voiceTest === 'started' && !tts.error && (
+                  <span className="text-[10px] font-mono text-emerald-300">sent to {tts.engine ?? 'voice engine'}</span>
+                )}
+                {voiceTest === 'failed' && !tts.error && (
+                  <span className="text-[10px] font-mono text-red-300">voice engine unavailable</span>
+                )}
               </div>
+              {tts.error && (
+                <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-2 flex items-start gap-2">
+                  <p className="flex-1 text-[11px] text-red-200 font-mono">🔇 {tts.error}</p>
+                  <button
+                    className="text-[10px] text-zinc-400 underline"
+                    onClick={() => {
+                      tts.clearError();
+                      setVoiceTest('idle');
+                    }}
+                  >
+                    dismiss
+                  </button>
+                </div>
+              )}
+              {tts.lastSpoken && (
+                <p className="text-[10px] text-zinc-500 leading-relaxed">
+                  Last spoken: <span className="text-zinc-300">“{tts.lastSpoken}”</span>
+                </p>
+              )}
+              {!tts.enabled && (
+                <p className="text-[10px] text-amber-400/90">
+                  Spoken replies are OFF. JARVIS will stay silent until you switch this on — Test voice
+                  still works while it is off.
+                </p>
+              )}
             </div>
 
             <div className="rounded-xl border border-[var(--jv-panel-line)] p-3 space-y-3">

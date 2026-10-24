@@ -64,7 +64,7 @@ import { WorldPanel } from './world-panel';
 import { RemotePanel } from './remote-panel';
 import { NotificationsBell } from './notifications-bell';
 import { PROVIDERS, getProvider, resolveModel } from '@/lib/providers';
-import { useConnections } from '@/lib/api-keys-store';
+import { consumeModelNotices, isVerified, useConnections } from '@/lib/api-keys-store';
 import { installTokenFetch } from '@/lib/api-token';
 import { toast } from '@/hooks/use-toast';
 import { ChatMessage, TypingIndicator, type ChatMessageData } from './chat-message';
@@ -80,6 +80,26 @@ import { JarvisBoot } from '@/components/jarvis/jarvis-boot';
 import type { JarvisVisualState } from '@/components/jarvis/jarvis-reactor';
 import { perfSample, perfStart } from '@/lib/perf';
 import { usePolling } from '@/hooks/use-polling';
+import {
+  TerminalSpeechGate,
+  buildActionState,
+  createActionId,
+  isTerminalPhase,
+  phaseFromTaskStatus,
+  taskFinalSentence,
+} from '@/lib/action-lifecycle';
+import { spokenProviderFailure } from '@/lib/provider-errors';
+
+interface ChatFailure {
+  error?: string;
+  errorCategory?: string;
+  hint?: string;
+  retryAfterSec?: number;
+  status?: number;
+  provider?: string;
+  model?: string;
+}
+type ChatFailureError = Error & { chatFailure?: ChatFailure };
 
 interface ConversationItem {
   id: string;
@@ -176,6 +196,22 @@ const ACTIVE_TASK_STATES = new Set([
   'blocked',
   'paused',
 ]);
+
+/**
+ * Short, speakable label for a user command ("YouTube kholo" → "YouTube
+ * kholna"). Used in every lifecycle sentence so the voice says WHAT failed
+ * instead of "command".
+ */
+function actionLabelForTask(text: string): string {
+  const clean = String(text ?? '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return 'Yeh kaam';
+  return clean.length > 60 ? `${clean.slice(0, 57)}…` : clean;
+}
+
 
 const JARVIS_STATE_LABEL: Record<JarvisVisualState, string> = {
   idle: 'STANDBY — ALL SYSTEMS NOMINAL',
@@ -378,6 +414,22 @@ export function Studio() {
   // ref, or the first-render closure (enabled=false) silences the greeting
   const ttsRef = useRef(tts);
   ttsRef.current = tts;
+
+  // A retired model id found in localStorage is rewritten to a supported one
+  // when settings load. That substitution must never be silent (spec §5), so
+  // it is announced once, with both ids named.
+  useEffect(() => {
+    const notices = consumeModelNotices();
+    if (!notices.length) return;
+    const text = notices
+      .map(
+        (n) =>
+          `${n.provider} ka purana model ${n.from} ab supported nahi hai, isliye ${n.to} set kar diya.`
+      )
+      .join(' ');
+    toast({ title: 'Model updated', description: text });
+    ttsRef.current.speak(text);
+  }, []);
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem('agentscope-spoken-summaries');
@@ -441,6 +493,20 @@ export function Studio() {
     if (jarvisErrTimer.current) clearTimeout(jarvisErrTimer.current);
     jarvisErrTimer.current = setTimeout(() => setJarvisError(false), 2800);
   }, []);
+  // ---- action lifecycle: every task gets a FINAL spoken status ------------
+  // The old flow spoke one sentence when a task STARTED and then went silent:
+  // success and failure were only visible if the user opened the task panel.
+  const terminalGateRef = useRef(new TerminalSpeechGate());
+  const approvalSpokenRef = useRef<Set<string>>(new Set());
+  const taskWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopTaskWatch = useCallback(() => {
+    if (taskWatchRef.current) {
+      clearInterval(taskWatchRef.current);
+      taskWatchRef.current = null;
+    }
+  }, []);
+  useEffect(() => stopTaskWatch, [stopTaskWatch]);
+
   const taskRunning = agenticTasks.some((t) => ACTIVE_TASK_STATES.has(t.status));
   const jarvisState: JarvisVisualState = jarvisError
     ? 'error'
@@ -501,6 +567,91 @@ export function Studio() {
   // flip the status pill back to STANDBY without a manual refresh — skipped
   // while hidden, refreshed once on return
   usePolling(loadAgenticTasks, 15_000);
+
+  /**
+   * Poll ONE task until it reaches a terminal state, then speak the REAL
+   * outcome exactly once (TerminalSpeechGate) and put it in the transcript.
+   */
+  const watchTask = useCallback(
+    (taskId: string, label: string) => {
+      stopTaskWatch();
+      const startedAt = Date.now();
+      const tick = async () => {
+        // give up after 30 minutes — a stuck task must not poll forever
+        if (Date.now() - startedAt > 30 * 60_000) {
+          stopTaskWatch();
+          return;
+        }
+        try {
+          const res = await fetch(`/api/agentic/tasks/${taskId}`);
+          if (!res.ok) return; // transient — next tick retries
+          const task = (await res.json()) as {
+            status?: string;
+            error?: string | null;
+            report?: { summary?: string; steps?: unknown[] } | null;
+            steps?: unknown[];
+          };
+          const status = String(task.status ?? 'running');
+          const stepCount = Array.isArray(task.steps) ? task.steps.length : 0;
+          const state = buildActionState({
+            id: taskId,
+            kind: 'task',
+            phase: phaseFromTaskStatus(status),
+            label,
+            detail: task.error ?? undefined,
+            spoken: taskFinalSentence({
+              status,
+              label,
+              error: task.error ?? undefined,
+              detailCount: stepCount,
+            }),
+          });
+
+          if (state.phase === 'needs_approval') {
+            if (!approvalSpokenRef.current.has(taskId)) {
+              approvalSpokenRef.current.add(taskId);
+              ttsRef.current.speak(state.spoken);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `life-${taskId}-approval`,
+                  role: 'assistant',
+                  content: `⏳ ${state.spoken}`,
+                  provider: 'jarvis',
+                  model: 'task-router',
+                },
+              ]);
+            }
+            return;
+          }
+
+          if (!isTerminalPhase(state.phase)) return;
+
+          stopTaskWatch();
+          if (!terminalGateRef.current.claim(state)) return; // already announced
+          ttsRef.current.speak(state.spoken);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `life-${taskId}-${state.phase}`,
+              role: 'assistant',
+              content: `${state.phase === 'succeeded' ? '✅' : state.phase === 'cancelled' ? '⏹️' : '⚠️'} ${state.spoken}`,
+              provider: 'jarvis',
+              model: 'task-router',
+            },
+          ]);
+          if (state.phase === 'failed') flashJarvisError();
+          void loadAgenticTasks();
+        } catch {
+          /* network hiccup — next tick retries */
+        }
+      };
+      void tick();
+      taskWatchRef.current = setInterval(() => void tick(), 2500);
+    },
+    [flashJarvisError, stopTaskWatch, loadAgenticTasks]
+  );
+
 
   useEffect(() => {
     // During streaming a chunk lands every ~50 ms — re-triggering an
@@ -663,9 +814,15 @@ export function Studio() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op: 'log', conversationId: convId, userContent: shown, assistantContent: ack }),
       }).catch(() => undefined);
-      tts.speak('Samajh gaya, kaam shuru kar diya.');
+      // ACKNOWLEDGEMENT (RECEIVED → UNDERSTOOD). The FINAL status is spoken by
+      // watchTask() once the engine actually finishes — never before.
+      const lifecycleLabel = actionLabelForTask(shown);
+      tts.speak(
+        `${buildActionState({ id: task.id, kind: 'task', phase: 'received', label: lifecycleLabel }).spoken} ${lifecycleLabel} shuru kar raha hoon.`
+      );
       await loadAgenticTasks();
       setAgenticTaskId(task.id);
+      watchTask(task.id, lifecycleLabel);
       // JARVIS home stays on the reactor view (it shows live task progress);
       // other modes jump into the full Agentic panel as before.
       setMode((prev) => (prev === 'jarvis' ? prev : 'agentic'));
@@ -710,6 +867,85 @@ export function Studio() {
       convId = conv.id;
       setActiveConvId(conv.id);
       loadConversations();
+    }
+
+    // ---- OFFLINE COMMANDS FIRST (spec §7) --------------------------------
+    // A deterministic command (open an allowlisted site/app, status, last
+    // error, cancel, help) runs WITHOUT any cloud API. This is the only path
+    // that still works when every provider is down — and it speaks.
+    try {
+      const offlineRes = await fetch('/api/jarvis', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op: 'command', content }),
+      });
+      if (offlineRes.ok) {
+        const offline = (await offlineRes.json()) as {
+          matched?: boolean;
+          reason?: string;
+          ok?: boolean;
+          outcome?: 'succeeded' | 'failed' | 'cancelled' | 'needs_approval' | 'unsupported';
+          spoken?: string;
+          detail?: string;
+          label?: string;
+        };
+        if (offline.matched && offline.spoken) {
+          const icon =
+            offline.outcome === 'succeeded'
+              ? '✅'
+              : offline.outcome === 'needs_approval'
+                ? '⏳'
+                : offline.outcome === 'cancelled'
+                  ? '⏹️'
+                  : '⚠️';
+          setMessages((prev) => [
+            ...prev,
+            { id: `off-${Date.now()}`, role: 'user', content },
+            {
+              id: `off-a-${Date.now()}`,
+              role: 'assistant',
+              content: `${icon} ${offline.spoken}`,
+              provider: 'jarvis',
+              model: 'offline',
+            },
+          ]);
+          setInput('');
+          // Persist the exchange so an offline command is still in the chat
+          // history after a reload (the offline path never reaches /api/chat,
+          // which is what normally writes the two rows). Failure to log must
+          // never break the spoken answer.
+          void fetch('/api/jarvis', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              op: 'log',
+              conversationId: convId,
+              userContent: content,
+              assistantContent: `${icon} ${offline.spoken}`,
+            }),
+          }).catch(() => undefined);
+          // ONE combined utterance: acknowledgement + real outcome, so the
+          // ack is never cut off by a second queued sentence.
+          ttsRef.current.speak(`Haan, main aapki command samajh gaya. ${offline.spoken}`);
+          if (offline.outcome === 'failed' || offline.outcome === 'unsupported') {
+            flashJarvisError();
+            toast({
+              title: 'Command failed',
+              description: offline.detail || offline.spoken,
+              variant: 'destructive',
+            });
+          } else if (offline.outcome === 'needs_approval') {
+            toast({
+              title: 'Approval chahiye',
+              description: 'JARVIS panel me Approve dabaiye — phir action chalega.',
+            });
+          }
+          streamingRef.current = false;
+          return;
+        }
+      }
+    } catch {
+      // offline layer unavailable (server error) — fall through to the AI path
     }
 
     // Jarvis router: decide chat vs job BEFORE anything is sent to the model.
@@ -781,19 +1017,43 @@ export function Studio() {
       });
 
       if (!res.ok) {
-        // A provider 429 keeps its own retry hint (server maps it through).
+        // The server classifies the failure (auth / model / rate limit / …)
+        // and sanitises it; keep that classification for the voice + UI
+        // instead of collapsing everything into one string.
         if (res.status === 429) {
           const data = (await res.json().catch(() => ({}))) as {
             retryAfterSec?: number;
+            error?: string;
+            errorCategory?: string;
+            hint?: string;
           };
           const wait =
             typeof data.retryAfterSec === 'number' && data.retryAfterSec > 0
               ? ` ${Math.ceil(data.retryAfterSec)}s me dobara try karo.`
               : '';
-          throw new Error(`Rate limit lag gayi.${wait}`);
+          const limited = new Error(
+            `${data.error || 'Rate limit lag gayi.'}${wait}`
+          ) as ChatFailureError;
+          limited.chatFailure = {
+            error: data.error || 'Provider rate limit reached.',
+            errorCategory: data.errorCategory || 'rate_limit',
+            hint: data.hint,
+            retryAfterSec: data.retryAfterSec,
+          };
+          throw limited;
         }
-        const err = await res.json().catch(() => ({ error: 'Request failed' }));
-        throw new Error(err.error || `HTTP ${res.status}`);
+        const err = (await res.json().catch(() => ({ error: 'Request failed' }))) as ChatFailure;
+        const failure = new Error(err.error || `HTTP ${res.status}`) as ChatFailureError;
+        failure.chatFailure = { ...err, status: res.status };
+        throw failure;
+      }
+
+      // A retired model id was replaced — say so, never silently.
+      const noticeRaw = res.headers.get('X-Model-Notice');
+      if (noticeRaw) {
+        const notice = decodeURIComponent(noticeRaw);
+        toast({ title: 'Model changed', description: notice });
+        ttsRef.current.speak(notice);
       }
 
       const reader = res.body!.getReader();
@@ -849,24 +1109,51 @@ export function Studio() {
       } catch {
         /* ignore */
       }
-      const msg =
-        err instanceof Error && err.name !== 'AbortError'
-          ? err.message
-          : 'Request stopped';
-      // On stream failure remove the empty placeholder assistant message so the
-      // conversation history stays consistent (an unsent error string is never
-      // persisted as an AI message). Surface the failure via toast instead.
+      const aborted = err instanceof Error && err.name === 'AbortError';
+      const msg = aborted ? 'Request stopped' : err instanceof Error ? err.message : 'Request failed';
+      const failure = (err as ChatFailureError)?.chatFailure;
+      // SPEAK the real reason. A failed reply used to produce a toast and
+      // silence — the acceptance criterion is that JARVIS either performs the
+      // action or clearly says why it could not.
+      const spoken = aborted
+        ? 'Request stop kar diya.'
+        : failure
+          ? spokenProviderFailure(providerInfo.name, {
+              category: (failure.errorCategory ?? 'unknown') as never,
+              message: failure.error ?? msg,
+            })
+          : `Jawab nahi mil paya. ${msg}`;
+      // Replace the empty placeholder with a REAL error message so the
+      // transcript (and the conversation history) shows what happened.
       setMessages((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last && last.role === 'assistant' && !last.content) {
-          next.pop();
+          next[next.length - 1] = {
+            ...last,
+            content: `⚠️ ${spoken}${failure?.hint ? `\n\n_${failure.hint}_` : ''}`,
+          };
+          return next;
         }
-        return next;
+        return [
+          ...next,
+          {
+            id: `err-${Date.now()}`,
+            role: 'assistant',
+            content: `⚠️ ${spoken}${failure?.hint ? `\n\n_${failure.hint}_` : ''}`,
+            provider: 'jarvis',
+            model: 'error',
+          },
+        ];
       });
-      if (err instanceof Error && err.name !== 'AbortError') {
+      if (!aborted) {
         flashJarvisError();
-        toast({ title: 'Connection error', description: msg, variant: 'destructive' });
+        ttsRef.current.speak(spoken);
+        toast({
+          title: failure?.errorCategory ? `Connection error (${failure.errorCategory})` : 'Connection error',
+          description: msg,
+          variant: 'destructive',
+        });
       }
     } finally {
       setStreaming(false);
@@ -1163,7 +1450,7 @@ export function Studio() {
                 >
                   {activeModel || 'default'}
                 </Badge>
-                {conn?.connected && (
+                {isVerified(conn) && (
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 )}
               </button>
@@ -1173,7 +1460,7 @@ export function Studio() {
                 <DropdownMenuItem
                   key={p.id}
                   onClick={() => {
-                    if (connections[p.id]?.connected || p.kind === 'zai' || p.id === 'ollama') {
+                    if (isVerified(connections[p.id]) || p.kind === 'zai' || p.id === 'ollama') {
                       switchProvider(p.id);
                       toast({ title: `${p.emoji} ${p.name} activated` });
                     } else {
@@ -1189,7 +1476,7 @@ export function Studio() {
                 >
                   <span>{p.emoji}</span>
                   <span className="flex-1">{p.name}</span>
-                  {connections[p.id]?.connected && (
+                  {isVerified(connections[p.id]) && (
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                   )}
                 </DropdownMenuItem>
@@ -1247,6 +1534,8 @@ export function Studio() {
               }}
               voice={voice}
               tts={tts}
+              voiceError={tts.error}
+              onDismissVoiceError={tts.clearError}
               handsFree={handsFree}
               toggleHandsFree={toggleHandsFree}
               micLang={micLang}

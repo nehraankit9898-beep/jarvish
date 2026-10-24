@@ -3,6 +3,9 @@ import { connectionRequestSchema } from '@/lib/connection-request';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { testProviderConnection } from '@/lib/agentic/provider-connection';
 import { recordAudit, clientIp } from '@/lib/agentic/audit';
+import { recordConnectionResult } from '@/lib/agentic/provider-store';
+import { recordLastError } from '@/lib/agentic/last-action-error';
+import { getProvider } from '@/lib/providers';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -29,6 +32,20 @@ export async function POST(req: NextRequest) {
       model: body.model,
       baseUrl: body.baseUrl,
     });
+    // The test result must be PERSISTED (it was computed and thrown away
+    // before, so the Providers panel could never show "verified").
+    await recordConnectionResult(body.provider, result.ok, result.error ?? '').catch(
+      () => undefined
+    );
+    if (!result.ok) {
+      recordLastError({
+        what: `${getProvider(body.provider)?.name ?? body.provider} connection test`,
+        category: String(result.errorCategory ?? 'unknown'),
+        message: result.error ?? '',
+        hint: result.hint,
+        secrets: body.apiKey ? [body.apiKey] : [],
+      });
+    }
     await recordAudit({
       actor: 'user',
       action: 'provider.test',

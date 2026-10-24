@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Zap, Settings2, Loader2, Clock, AlertTriangle } from 'lucide-react';
 import { PROVIDERS, getProvider, type ProviderId } from '@/lib/providers';
-import { useConnections } from '@/lib/api-keys-store';
+import { isVerified, useConnections } from '@/lib/api-keys-store';
 
 /**
  * ComparePanel — "Ek prompt, saare models ek saath" mode.
@@ -53,8 +53,9 @@ export function ComparePanel({
       PROVIDERS.filter((p) => {
         if (p.id === 'zai') return true; // built-in — hamesha available, key nahi chahiye
         const c = connections[p.id as ProviderId];
-        if (!c?.connected) return false;
-        return !!(c.apiKey?.trim() || c.baseUrl?.trim());
+        // only a configuration that passed its own test may be compared
+        if (!isVerified(c)) return false;
+        return !!(c?.apiKey?.trim() || c?.baseUrl?.trim() || c?.serverStored);
       }),
     [connections]
   );
