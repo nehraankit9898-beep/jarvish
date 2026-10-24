@@ -10,13 +10,13 @@
 //   4. DISABLED / REJECTED — off.
 //
 // SECURITY MODEL (mirrors the platform spec):
-//   - the tool code is a plain async function body executed in a DEDICATED
-//     V8 context (node:vm) whose global object contains ONLY what is listed in
-//     TOOL_SANDBOX_GLOBALS. `process`, `require`, `fs`, the host `fetch` and
-//     the host intrinsics are structurally absent, and string code generation
-//     (eval / new Function) is switched off for that context, so the classic
-//     `Function("return this")()` / `""["constructor"]` escapes cannot reach
-//     the host realm;
+//   - the tool code runs in a SHORT-LIVED CHILD PROCESS with a sanitized
+//     environment, bounded heap and Node's permission model (no filesystem
+//     write, child process, worker, addon or WASI permission). Its V8 context
+//     disables string code generation. No host object or function crosses
+//     into the Studio process, so a realm escape cannot reach Studio secrets;
+//   - if that isolated runtime cannot start, execution FAILS CLOSED. There is
+//     deliberately no in-process `node:vm` fallback;
 //   - a static scan (see FORBIDDEN_CODE_PATTERNS) runs BEFORE approval and
 //     again at load time so obviously hostile code is rejected with a clear
 //     reason instead of failing at runtime (defence in depth, not the
@@ -29,6 +29,8 @@
 
 import { z } from 'zod';
 import vm from 'node:vm';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { db } from '@/lib/db';
 import {
   registerTool,
@@ -37,7 +39,7 @@ import {
   type ToolInvocation,
   type ToolResult,
 } from './tool-registry';
-import { assertOutboundUrl, OutboundUrlError } from './outbound';
+import { assertOutboundUrl } from './outbound';
 import { recordAudit } from './audit';
 
 // ---------- schema ----------
@@ -359,134 +361,230 @@ function compileCustomTool(row: {
  */
 function makeToolApi(tool: LoadedCustomTool, onLog: (line: string) => void) {
   const base = tool.baseUrl ? new URL(tool.baseUrl).origin : '';
+  const controllers = new Set<AbortController>();
+
+  const checkedTarget = async (raw: string): Promise<URL> => {
+    let target = String(raw ?? '');
+    if (base && !/^https?:\/\//i.test(target)) {
+      target = `${base.replace(/\/$/, '')}/${target.replace(/^\//, '')}`;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(target);
+    } catch {
+      throw new CustomToolError('fetch', `Invalid URL: ${target}`);
+    }
+    await assertOutboundUrl(parsed.toString(), {});
+    if (base && parsed.origin !== base) {
+      throw new CustomToolError('fetch', `Custom tool may only call its declared baseUrl (${base})`);
+    }
+    return parsed;
+  };
+
   return {
     async fetch(url: string, init: RequestInit = {}): Promise<{ status: number; body: string; ok: boolean }> {
-      let target = String(url ?? '');
-      if (base && !/^https?:\/\//i.test(target)) {
-        target = `${base.replace(/\/$/, '')}/${target.replace(/^\//, '')}`;
+      let current = String(url ?? '');
+      for (let hop = 0; hop < 6; hop++) {
+        const parsed = await checkedTarget(current);
+        const controller = new AbortController();
+        controllers.add(controller);
+        const timer = setTimeout(() => controller.abort(), 30_000);
+        try {
+          let requestInit = init;
+          const res = await fetch(parsed.toString(), {
+            ...requestInit,
+            // Every redirect is checked again. Automatic redirects would let a
+            // public URL hop to loopback, metadata, or another origin.
+            redirect: 'manual',
+            signal: controller.signal,
+            headers: {
+              'user-agent': 'AgentScope-Studio-CustomTool/1.0',
+              ...(requestInit.headers ?? {}),
+            },
+          });
+          const location = res.headers.get('location');
+          if (res.status >= 300 && res.status < 400 && location) {
+            void res.body?.cancel().catch(() => undefined);
+            if (hop === 5) throw new CustomToolError('fetch', 'Too many redirects (maximum 5)');
+            current = new URL(location, parsed).toString();
+            if (res.status === 303 && !['GET', 'HEAD'].includes((requestInit.method ?? 'GET').toUpperCase())) {
+              const headers = { ...(requestInit.headers ?? {}) } as Record<string, string>;
+              delete headers['content-type'];
+              delete headers['Content-Type'];
+              requestInit = { ...requestInit, method: 'GET', body: undefined, headers };
+              init = requestInit;
+            }
+            continue;
+          }
+
+          const reader = res.body?.getReader();
+          if (!reader) return { status: res.status, body: '', ok: res.ok };
+          const chunks: Uint8Array[] = [];
+          let size = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (size + value.byteLength > 200_000) {
+              chunks.push(value.slice(0, 200_000 - size));
+              size = 200_000;
+              await reader.cancel().catch(() => undefined);
+              break;
+            }
+            chunks.push(value);
+            size += value.byteLength;
+          }
+          const merged = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) {
+            merged.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return { status: res.status, body: new TextDecoder().decode(merged), ok: res.ok };
+        } finally {
+          clearTimeout(timer);
+          controllers.delete(controller);
+        }
       }
-      let parsed: URL;
-      try {
-        parsed = new URL(target);
-      } catch {
-        throw new CustomToolError('fetch', `Invalid URL: ${target}`);
-      }
-      // SSRF guard — same rules as the provider connections
-      await assertOutboundUrl(parsed.toString(), {});
-      // lock to the declared origin when one exists
-      if (base && parsed.origin !== base) {
-        throw new CustomToolError('fetch', `Custom tool may only call its declared baseUrl (${base})`);
-      }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
-      try {
-        const res = await fetch(parsed.toString(), {
-          ...init,
-          signal: controller.signal,
-          headers: {
-            'user-agent': 'AgentScope-Studio-CustomTool/1.0',
-            ...(init.headers ?? {}),
-          },
-        });
-        const body = (await res.text()).slice(0, 200_000);
-        return { status: res.status, body, ok: res.ok };
-      } finally {
-        clearTimeout(timer);
-      }
+      throw new CustomToolError('fetch', 'Too many redirects');
     },
     log: (line: string) => onLog(String(line).slice(0, 500)),
     now: () => Date.now(),
+    cancel: () => {
+      for (const controller of controllers) controller.abort();
+      controllers.clear();
+    },
   };
 }
 
-/** Hard cap on a single tool invocation (the sync part is killed at this point). */
+/** Hard cap on a single tool invocation; the parent kills the whole child on expiry. */
 export const TOOL_SANDBOX_TIMEOUT_MS = 30_000;
 
 /**
- * The globals a custom tool can see. Everything the host has and is NOT listed
- * here simply does not exist inside the sandbox — no `process`, no `require`,
- * no filesystem, no host `fetch`, no provider store, no env.
+ * Execute in the isolated runner. Exported for deterministic timeout and
+ * boundary regression tests; production callers use the registry lifecycle.
  */
-const TOOL_SANDBOX_GLOBALS = [
-  'URL',
-  'URLSearchParams',
-  'TextEncoder',
-  'TextDecoder',
-  'AbortController',
-  'AbortSignal',
-] as const;
-
-/**
- * H8: run the tool body in a DEDICATED V8 context instead of a host-realm
- * `new Function`. Inside that context `Function`, `eval` and
- * `""["constructor"]["constructor"]` resolve to the SANDBOX realm and string
- * code generation is disabled outright (`codeGeneration.strings: false`), so
- * compiled strings can no longer reach the host realm and read
- * `process.env`/the provider store. Timers are capped and always torn down
- * with the invocation, so a tool cannot outlive its own call.
- */
-function runToolCode(
+export function runToolCode(
   code: string,
   params: Record<string, unknown>,
-  api: unknown,
+  api: ReturnType<typeof makeToolApi>,
   timeoutMs = TOOL_SANDBOX_TIMEOUT_MS
 ): Promise<unknown> {
-  const timers = new Set<ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>>();
-  const clearAll = () => {
-    for (const t of timers) {
-      clearTimeout(t as ReturnType<typeof setTimeout>);
-      clearInterval(t as ReturnType<typeof setInterval>);
+  const runner = path.join(process.cwd(), 'scripts', 'custom-tool-runner.cjs');
+  const nodeBinary = (process.env.AGENTSCOPE_NODE_BINARY ?? 'node').trim() || 'node';
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? '',
+    NODE_OPTIONS: '',
+    NODE_ENV: process.env.NODE_ENV ?? 'production',
+    ...(process.platform === 'win32'
+      ? { SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT ?? 'C:\Windows' }
+      : {}),
+  };
+
+  // Never fall back to the parent's node:vm context. Node's permission model
+  // denies filesystem writes, child processes, workers, addons and WASI in
+  // this short-lived process; only the runner source itself is readable. If
+  // the runtime cannot provide that isolation, execution fails closed.
+  const child = spawn(
+    nodeBinary,
+    [
+      '--experimental-permission',
+      `--allow-fs-read=${runner}`,
+      '--max-old-space-size=64',
+      '--max-semi-space-size=4',
+      runner,
+    ],
+    { env, shell: false, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }
+  );
+
+  return new Promise<unknown>((resolve, reject) => {
+    let settled = false;
+    let stderr = '';
+    const finish = (error: Error | null, value?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      api.cancel();
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      } catch {
+        // already exiting
+      }
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`Custom tool exceeded the ${timeoutMs}ms execution limit and was terminated`)),
+      timeoutMs + 2_000
+    );
+
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      if (stderr.length < 2_000) stderr += String(chunk).slice(0, 2_000 - stderr.length);
+    });
+    child.on('error', (err) => finish(new Error(`Isolated custom-tool runtime failed to start: ${err.message}`)));
+    child.on('exit', (code, signal) => {
+      if (!settled) {
+        const detail = stderr.trim().slice(-500);
+        finish(new Error(
+          `Isolated custom-tool runtime exited before returning a result (${signal ?? `code ${code ?? 'unknown'}`})` +
+          (detail ? `: ${detail}` : '')
+        ));
+      }
+    });
+    child.on('message', (raw: unknown) => {
+      if (settled || !raw || typeof raw !== 'object') return;
+      const message = raw as {
+        type?: string;
+        id?: number;
+        url?: string;
+        init?: RequestInit;
+        line?: string;
+        ok?: boolean;
+        result?: unknown;
+        error?: string;
+      };
+      if (message.type === 'log') {
+        api.log(String(message.line ?? ''));
+        return;
+      }
+      if (message.type === 'fetch' && typeof message.id === 'number') {
+        let size = 0;
+        try {
+          size = JSON.stringify(message.init ?? {}).length;
+        } catch {
+          size = Number.MAX_SAFE_INTEGER;
+        }
+        if (size > 64 * 1024 || typeof message.url !== 'string' || message.url.length > 8_192) {
+          try {
+            child.send({ type: 'fetch_result', id: message.id, ok: false, error: 'Fetch request is too large or malformed' });
+          } catch {
+            // child may have exited
+          }
+          return;
+        }
+        void api.fetch(message.url, message.init ?? {}).then(
+          (result) => {
+            if (!settled && child.connected) child.send({ type: 'fetch_result', id: message.id, ok: true, result });
+          },
+          (err) => {
+            if (!settled && child.connected) {
+              child.send({ type: 'fetch_result', id: message.id, ok: false, error: errorMessage(err).slice(0, 500) });
+            }
+          }
+        );
+        return;
+      }
+      if (message.type === 'result') {
+        if (message.ok) finish(null, message.result);
+        else finish(new Error(String(message.error ?? 'Tool execution failed').slice(0, 1_000)));
+      }
+    });
+
+    try {
+      child.send({ type: 'run', code, params, timeoutMs });
+    } catch (err) {
+      finish(new Error(`Could not start the isolated custom tool: ${errorMessage(err)}`));
     }
-    timers.clear();
-  };
-  const clamp = (ms: unknown, min: number, max: number) =>
-    Math.min(Math.max(min, Number.isFinite(Number(ms)) ? Number(ms) : min), max);
-
-  const sandbox: Record<string, unknown> = { params, api };
-  for (const name of TOOL_SANDBOX_GLOBALS) sandbox[name] = globalThis[name as keyof typeof globalThis];
-  sandbox.setTimeout = (fn: unknown, ms: unknown = 0, ...args: unknown[]) => {
-    const delay = clamp(ms, 0, timeoutMs);
-    const id = setTimeout(() => {
-      timers.delete(id);
-      if (typeof fn === 'function') (fn as (...a: unknown[]) => void)(...args);
-    }, delay);
-    timers.add(id);
-    return id;
-  };
-  sandbox.clearTimeout = (id: unknown) => {
-    if (id !== undefined && id !== null) clearTimeout(id as ReturnType<typeof setTimeout>);
-    timers.delete(id as ReturnType<typeof setTimeout>);
-  };
-  sandbox.setInterval = (fn: unknown, ms: unknown = 1000, ...args: unknown[]) => {
-    const every = clamp(ms, 1000, 60_000);
-    const id = setInterval(() => {
-      if (typeof fn === 'function') (fn as (...a: unknown[]) => void)(...args);
-    }, every);
-    timers.add(id);
-    return id;
-  };
-  sandbox.clearInterval = (id: unknown) => {
-    if (id !== undefined && id !== null) clearInterval(id as ReturnType<typeof setInterval>);
-    timers.delete(id as ReturnType<typeof setInterval>);
-  };
-
-  let context: vm.Context;
-  try {
-    context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
-  } catch {
-    context = vm.createContext(sandbox);
-  }
-  const script = new vm.Script(wrapToolCode(code), { filename: 'custom-tool.js' });
-  let value: unknown;
-  try {
-    // `timeout` bounds the SYNCHRONOUS part — an infinite loop in a tool can
-    // no longer wedge the whole Studio process
-    value = script.runInContext(context, { timeout: timeoutMs, breakOnSigint: false });
-  } catch (err) {
-    clearAll();
-    throw err;
-  }
-  return Promise.resolve(value).finally(clearAll);
+  });
 }
 
 function loadCustomToolIntoRegistry(row: {

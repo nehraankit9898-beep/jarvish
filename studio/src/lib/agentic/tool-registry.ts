@@ -2,7 +2,7 @@
 // schema validation, permission enforcement, timeouts, cancellation, audit logs.
 
 import { z } from 'zod';
-import { protect, type SecretScan } from './secrets';
+import { protect, redactUnknown, type SecretScan } from './secrets';
 import { type Permission } from './permissions';
 import { executeCommand } from './terminal';
 import {
@@ -118,7 +118,11 @@ export function getAuditLog(limit = 100): ToolCallRecord[] {
 // ---------- audit logging ----------
 
 function auditCall(record: ToolCallRecord): void {
-  TOOL_AUDIT_LOG.push(record);
+  TOOL_AUDIT_LOG.push({
+    ...record,
+    parameters: redactUnknown(record.parameters) as Record<string, any>,
+    result: redactUnknown(record.result) as ToolResult,
+  });
   if (TOOL_AUDIT_LOG.length > MAX_AUDIT_LOG) {
     TOOL_AUDIT_LOG.splice(0, TOOL_AUDIT_LOG.length - MAX_AUDIT_LOG);
   }
@@ -265,11 +269,16 @@ export async function invokeTool(invocation: ToolInvocation): Promise<ToolResult
         at: new Date().toISOString(),
       };
 
-      // redact secrets from result data
-      if (enriched.data !== undefined && typeof enriched.data === 'string') {
-        const { masked, found } = protect(enriched.data);
-        enriched.data = masked;
-        enriched.redacted = found.length > 0 ? { found, masked } : undefined;
+      // Redact every result shape, not only top-level strings (file reads and
+      // connector responses commonly nest credentials in objects/arrays).
+      if (enriched.data !== undefined) {
+        if (typeof enriched.data === 'string') {
+          const { masked, found } = protect(enriched.data);
+          enriched.data = masked;
+          enriched.redacted = found.length > 0 ? { found, masked } : undefined;
+        } else {
+          enriched.data = redactUnknown(enriched.data);
+        }
       }
       if (enriched.error && typeof enriched.error === 'string') {
         const { masked } = protect(enriched.error);
@@ -429,10 +438,11 @@ registerTool(
         approvedCommands,
         timeoutMs,
       });
+      const succeeded = res.exitCode === 0;
       return makeToolResult(
-        true,
+        succeeded,
         { command: res.command, exitCode: res.exitCode, output: res.output, durationMs: res.durationMs },
-        undefined,
+        succeeded ? undefined : `Command exited with code ${res.exitCode ?? 'unknown'}`,
         { permission: res.permission, exitCode: res.exitCode }
       );
     } catch (err) {

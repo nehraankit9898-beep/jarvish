@@ -36,3 +36,9 @@ await copyDir(
   path.join(root, 'prisma'),
   path.join(standalone, 'prisma')
 );
+// The custom-tool executor must remain a real file: Node starts it as a
+// separate permission-restricted process rather than bundling it into Next.
+await copyDir(
+  path.join(root, 'scripts', 'custom-tool-runner.cjs'),
+  path.join(standalone, 'scripts', 'custom-tool-runner.cjs')
+);

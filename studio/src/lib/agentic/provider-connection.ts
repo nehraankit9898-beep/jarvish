@@ -199,10 +199,10 @@ export async function testProviderConnection(
       return { ok: false, error: 'API key is required', errorCategory: 'config', model };
     }
     const res = await fetch(
-      `${base}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      `${base}/models/${model}:generateContent`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: 'Say OK' }] }],
           generationConfig: { maxOutputTokens: 10 },
@@ -307,8 +307,9 @@ export async function listProviderModels(
 
     // gemini
     if (!apiKey) return { models: [], error: 'API key is required' };
-    const res = await fetch(`${base}/models?key=${encodeURIComponent(apiKey)}`, {
+    const res = await fetch(`${base}/models`, {
       method: 'GET',
+      headers: { 'x-goog-api-key': apiKey },
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return { models: [], error: await errorFromResponse(res) };

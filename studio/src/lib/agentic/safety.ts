@@ -28,6 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { cancelAllTaskExecutions } from './execution-cancellation';
 
 // ---------- kill switch ----------
 
@@ -91,6 +92,7 @@ export function engageKill(reason = 'manual', source = 'user'): KillState {
   };
   memStore().state = state;
   writeKillFile(state);
+  cancelAllTaskExecutions();
   return state;
 }
 

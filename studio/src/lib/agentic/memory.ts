@@ -131,24 +131,24 @@ export async function saveMemory(input: {
   assertNoCredential(content);
   const masked = protect(content).masked;
 
-  const existing = await db.memoryEntry.findUnique({
+  // Atomic upsert: concurrent first writes used to both observe "not found"
+  // and one then failed with P2002 instead of deduplicating the memory key.
+  const row = await db.memoryEntry.upsert({
     where: { scope_taskId_key: { scope, taskId, key } },
+    update: {
+      content: masked,
+      category,
+      ...(input.source !== undefined ? { source: input.source } : {}),
+    },
+    create: {
+      scope,
+      taskId,
+      category,
+      key,
+      content: masked,
+      source: input.source ?? 'user',
+    },
   });
-  const row = existing
-    ? await db.memoryEntry.update({
-        where: { id: existing.id },
-        data: { content: masked, category, source: input.source ?? existing.source },
-      })
-    : await db.memoryEntry.create({
-        data: {
-          scope,
-          taskId,
-          category,
-          key,
-          content: masked,
-          source: input.source ?? 'user',
-        },
-      });
   return toDto(row);
 }
 

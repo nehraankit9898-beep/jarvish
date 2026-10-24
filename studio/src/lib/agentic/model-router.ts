@@ -24,6 +24,7 @@ import {
   type AgentRoutingConfig,
   type CredentialMap,
 } from './agent-config';
+import { onTaskExecutionCancelled } from './execution-cancellation';
 
 export type CompleteFn = (
   messages: CoreChatMessage[],
@@ -166,6 +167,8 @@ export interface ModelRouterOptions {
    * mode). Supplied by the orchestrator from the server-side provider store.
    */
   policy?: RouterPolicy;
+  /** task whose cancel/kill-switch signal aborts calls and retry backoff */
+  taskId?: string;
 }
 
 /**
@@ -215,6 +218,7 @@ export class ModelRouter {
   private healthCooldownMs: number;
   private retryBackoffMs: number;
   private policy: RouterPolicy;
+  private taskId?: string;
   private health = new Map<string, HealthState>();
   /** full routing journal of this run (no secrets) */
   readonly journal: ModelRouteRecord[] = [];
@@ -231,6 +235,7 @@ export class ModelRouter {
     this.healthCooldownMs = opts.healthCooldownMs ?? DEFAULT_HEALTH_COOLDOWN_MS;
     this.retryBackoffMs = opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
     this.policy = opts.policy ?? {};
+    this.taskId = opts.taskId;
   }
 
   /** The model config a role would use right now (primary only). */
@@ -396,6 +401,23 @@ export class ModelRouter {
     messages: CoreChatMessage[],
     opts: { temperature?: number; maxTokens?: number } = {}
   ): Promise<RouterResult> {
+    const controller = new AbortController();
+    const unregister = this.taskId
+      ? onTaskExecutionCancelled(this.taskId, () => controller.abort())
+      : () => undefined;
+    try {
+      return await this.completeWithSignal(role, messages, opts, controller.signal);
+    } finally {
+      unregister();
+    }
+  }
+
+  private async completeWithSignal(
+    role: AgentRole,
+    messages: CoreChatMessage[],
+    opts: { temperature?: number; maxTokens?: number },
+    signal: AbortSignal
+  ): Promise<RouterResult> {
     const primary = this.modelFor(role);
     const chain = fallbackChain(primary).filter((c) => c.provider);
     if (!chain.length) {
@@ -482,6 +504,7 @@ export class ModelRouter {
       const maxRetries = Math.max(0, target.maxRetries ?? 0);
 
       for (let retry = 0; retry <= maxRetries; retry++) {
+        if (signal.aborted) throw new Error('Model call cancelled');
         attempts++;
         const attemptStarted = this.now();
         const llmConfig: LLMConfig = {
@@ -492,6 +515,7 @@ export class ModelRouter {
           temperature: opts.temperature ?? target.temperature ?? 0.3,
           maxTokens: opts.maxTokens ?? target.maxTokens ?? 8192,
           timeoutMs: target.timeoutMs,
+          signal,
         };
 
         try {
@@ -527,6 +551,7 @@ export class ModelRouter {
             usage,
           };
         } catch (err) {
+          if (signal.aborted) throw new Error('Model call cancelled');
           const classified = classifyRouterError(err);
           lastError = classified;
           const latencyMs = this.now() - attemptStarted;
@@ -561,7 +586,7 @@ export class ModelRouter {
             classified.retryAfterMs !== undefined
               ? classified.retryAfterMs
               : this.retryBackoffMs * Math.pow(2, retry);
-          await delay(waitMs, this.now);
+          await delay(waitMs, this.now, signal);
         }
       }
     }
@@ -579,14 +604,33 @@ function healthKey(provider: string, model: string): string {
   return `${provider}::${model}`;
 }
 
-function delay(ms: number, now: () => number): Promise<void> {
+function delay(ms: number, now: () => number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
+  if (signal?.aborted) return Promise.reject(new Error('Model call cancelled'));
+  return new Promise((resolve, reject) => {
     const started = now();
-    const tick = () => {
-      if (now() - started >= ms) resolve();
-      else setTimeout(tick, Math.min(50, ms));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
     };
-    setTimeout(tick, 10);
+    const onAbort = () => {
+      cleanup();
+      reject(new Error('Model call cancelled'));
+    };
+    const tick = () => {
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      if (now() - started >= ms) {
+        cleanup();
+        resolve();
+      } else {
+        timer = setTimeout(tick, Math.min(50, ms));
+      }
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(tick, 10);
   });
 }

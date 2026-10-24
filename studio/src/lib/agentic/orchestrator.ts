@@ -57,6 +57,7 @@ import { loadRouterPolicy, loadStoredCredentials } from './provider-store';
 import { detectPlanGaps, hasCriticalGaps, gapsForPlanner } from './plan-gaps';
 import { createNotification } from './notifications';
 import { recordAudit } from './audit';
+import { isTaskExecutionCancelled, resetTaskExecution } from './execution-cancellation';
 import { normalizeTaskStatus } from './types';
 import type {
   AgenticEvent,
@@ -328,6 +329,7 @@ async function createRouter(
     credentials: merged,
     complete,
     policy,
+    taskId: task.id,
     onRoute: (record: ModelRouteRecord) => {
       emit({
         type: 'model_routed',
@@ -492,6 +494,7 @@ export async function planTask(
   const emit = makeEmitter(taskId, sse);
   const task = await db.agenticTask.findUnique({ where: { id: taskId } });
   if (!task) throw new Error('Task not found');
+  resetTaskExecution(taskId);
 
   const mergedConfig: TaskConfig = { ...defaultTaskConfig(), ...taskConfig };
   const routing = opts.routing ?? undefined;
@@ -1204,6 +1207,7 @@ export async function runTask(
     await emit.drain();
     return;
   }
+  resetTaskExecution(taskId);
 
   // Jarvis #2: screen tasks run the VISION loop (screenshot → model → ONE
   // approval-gated action), not the workspace/file engine
@@ -1443,6 +1447,10 @@ export async function runTask(
 
     const planStep = execOrder[pos];
 
+    // The parallel runner owns read-only steps. Running them here as well
+    // duplicated model calls, commands, audit events and provider cost.
+    if (isReadOnlyKind(planStep.kind)) continue;
+
     // ---- dependency check ----
     const statuses = await statusOf();
     const deps = checkDependencies(planStep, statuses, planIndexes(planSteps));
@@ -1647,11 +1655,25 @@ export async function runTask(
     return;
   }
 
+  const statusesNow = await statusOf();
+  const failedParallel = planSteps.find((s) => statusesNow.get(s.index) === 'failed');
+  if (failedParallel) {
+    const row = await db.agenticStep.findFirst({ where: { taskId, index: failedParallel.index } });
+    if (row) {
+      emit({ type: 'step_done', taskId, at: new Date().toISOString(), stepIndex: failedParallel.index - 1, data: { status: 'failed', title: failedParallel.title } });
+      await failOrPause(taskId, emit, {
+        summary: `Read-only step ${failedParallel.index} (${failedParallel.title}) failed.`,
+        remainingBugs: [`Step ${failedParallel.index}: ${failedParallel.title} failed`],
+      }, mergedConfig);
+      await emit.drain();
+      return;
+    }
+  }
+
   // ---- steps whose dependencies were PENDING while the serial loop passed
   // them (the loop `continue`d) get one more pass now that the parallel
   // agents are done. Recursing into runTask is safe: passed/skipped/failed
   // steps are skipped, the retry budget and timeout keep counting.
-  const statusesNow = await statusOf();
   const stillRunnable = planSteps.filter((s) => {
     const st = statusesNow.get(s.index);
     if (st && st !== 'pending' && st !== 'paused') return false;
@@ -1793,6 +1815,9 @@ async function executeStep(params: {
             mergedConfig.maxFixAttempts ?? MAX_FIX_ATTEMPTS
           );
         } catch (err) {
+          if (await isCancelled(task.id) || isTaskExecutionCancelled(task.id)) {
+            return { kind: 'cancelled' };
+          }
           const msg = err instanceof Error ? err.message : 'LLM call failed';
           const classified = classifyTaskError(msg);
           if (classified === 'transient') {
@@ -1804,6 +1829,7 @@ async function executeStep(params: {
             return { kind: 'blocked', output: msg };
           }
           await stepLog(step.id, 'error', `${roleForStep(planStep.kind)} LLM error: ${msg}`);
+          await stepSetStatus(step.id, 'failed');
           return { kind: 'failed', output: msg };
         }
         actions = produced.actions;
@@ -1830,6 +1856,7 @@ async function executeStep(params: {
               stepIndex,
               data: { text: asciiText(`🚫 ${blocked}`) },
             });
+            await stepSetStatus(step.id, 'failed');
             return { kind: 'failed', output: blocked };
           }
           try {
@@ -1960,10 +1987,13 @@ async function executeStep(params: {
         continue;
       }
 
-      // success
-      const snap = await snapshot(task.id, `step-${planStep.index}: ${planStep.title}`);
+      // success. Read-only agents never change the workspace, so they skip
+      // git entirely (and cannot race another reader on the index/refs).
+      const snap = readOnlyStep
+        ? { hash: '', label: 'read-only' }
+        : await snapshot(task.id, `step-${planStep.index}: ${planStep.title}`);
       await stepSetStatus(step.id, 'passed', { testResult: 'pass' });
-      await stepLog(step.id, 'diff', `git snapshot: ${snap.hash} (${snap.label})`);
+      if (!readOnlyStep) await stepLog(step.id, 'diff', `git snapshot: ${snap.hash} (${snap.label})`);
       emit({
         type: 'step_done',
         taskId: task.id,
@@ -2287,14 +2317,17 @@ async function finishTask(
     ),
   };
 
-  await db.agenticTask.update({
-    where: { id: taskId },
+  const updated = await db.agenticTask.updateMany({
+    where: { id: taskId, status: { notIn: ['done', 'failed', 'cancelled'] } },
     data: {
       status: outcome,
       report: JSON.stringify(report),
       error: outcome === 'done' ? null : failure?.summary ?? 'Failed',
     },
   });
+  // Cancellation may have landed while the report/diff was being assembled.
+  // Never resurrect a terminal task or emit a contradictory final event.
+  if (updated.count === 0) return;
 
   emit({ type: 'report', taskId, at: new Date().toISOString(), data: report });
   emit({
@@ -2623,8 +2656,8 @@ async function finishScreenTask(
   });
   if (!current) return;
   if (['cancelled', 'done', 'failed'].includes(normalizeTaskStatus(current.status))) return;
-  await db.agenticTask.update({
-    where: { id: taskId },
+  const updated = await db.agenticTask.updateMany({
+    where: { id: taskId, status: { notIn: ['cancelled', 'done', 'failed'] } },
     data: {
       status: outcome === 'done' ? 'done' : outcome === 'blocked' ? 'blocked' : outcome === 'cancelled' ? 'cancelled' : 'failed',
       error: outcome === 'done' ? null : report.summary,
@@ -2632,6 +2665,7 @@ async function finishScreenTask(
       blockedReason: outcome === 'blocked' ? report.summary : '',
     },
   });
+  if (updated.count === 0) return;
   emit({
     type: 'done',
     taskId,

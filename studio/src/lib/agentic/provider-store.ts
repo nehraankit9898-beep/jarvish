@@ -100,8 +100,10 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 /**
  * Infer the cost class of a provider.
  *
- * Precedence: explicit configuration → the catalog's `free` flag → a `:free`
- * model suffix (OpenRouter style) → 'unknown'.
+ * Precedence: a `:free` model suffix → explicit configuration → the
+ * catalog's `free` flag → 'unknown'. OpenRouter without that suffix is paid
+ * unless an operator explicitly overrides the saved class; the live router
+ * still requires the suffix regardless of that provider-wide override.
  *
  * 'unknown' is treated as PAID by the free-only policy: the safe default is
  * never to spend money the user did not authorise.
@@ -111,12 +113,16 @@ export function inferCostClass(
   model: string | undefined,
   explicit?: CostClass
 ): CostClass {
+  // A per-model free marker is more precise than a provider-wide setting.
+  if (model && /:free$/i.test(model.trim())) return 'free';
   if (explicit === 'free' || explicit === 'paid' || explicit === 'unknown') {
     return explicit;
   }
   const info = getProvider(providerId);
+  // OpenRouter is a mixed-cost gateway, not a free provider. Only its
+  // explicitly marked `:free` models are eligible without an operator override.
+  if (providerId === 'openrouter') return 'paid';
   if (info?.free) return 'free';
-  if (model && /:free$/i.test(model.trim())) return 'free';
   if (info) return 'paid';
   return 'unknown';
 }
@@ -333,11 +339,11 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderDt
   // meant that an unrelated partial save (priority reorder, label, enable)
   // wiped a user's explicit free/paid classification and free-only routing
   // quietly changed its mind about a provider.
-  const costClass = inferCostClass(
-    provider,
-    model,
-    input.costClass ?? (existing?.costClass as CostClass | undefined)
-  );
+  const modelChanged = input.model !== undefined && model !== (existing?.model ?? '');
+  const inheritedCostClass = modelChanged && input.costClass === undefined
+    ? undefined
+    : input.costClass ?? (existing?.costClass as CostClass | undefined);
+  const costClass = inferCostClass(provider, model, inheritedCostClass);
 
   const data = {
     label: (input.label ?? existing?.label ?? '').slice(0, 120),
@@ -614,6 +620,9 @@ export async function loadRouterPolicy(): Promise<RouterPolicy> {
       // to be returned first, so free-only mode refused exactly the free models
       // it was configured to use (and 'prefer free first' never moved them up).
       if (model && /:free$/i.test(String(model).trim())) return 'free';
+      // Never let a provider-wide/catalog "free" flag make an arbitrary
+      // OpenRouter model eligible. Only the explicit per-model suffix wins.
+      if (provider === 'openrouter') return inferCostClass(provider, model);
       const configured = costByProvider.get(provider);
       if (configured && configured !== 'unknown') return configured;
       return inferCostClass(provider, model);

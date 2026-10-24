@@ -18,6 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { assertOutboundUrl, OutboundUrlError } from './outbound';
 import { recordAudit } from './audit';
 import { createNotification } from './notifications';
@@ -96,8 +97,12 @@ function filenameFromHeaders(headers: Headers, url: URL): string {
   }
   const plain = cd.match(/filename="?([^";]+)"?/i);
   if (plain?.[1]) return plain[1];
-  const fromPath = path.basename(decodeURIComponent(url.pathname));
-  return fromPath || `download-${Date.now()}.bin`;
+  try {
+    const fromPath = path.basename(decodeURIComponent(url.pathname));
+    return fromPath || `download-${Date.now()}.bin`;
+  } catch {
+    return `download-${Date.now()}.bin`;
+  }
 }
 
 export interface DownloadResult {
@@ -141,6 +146,7 @@ export async function downloadToDownloads(
     let current = parsed.toString();
     for (let hop = 0; hop < 5 && !res; hop++) {
       const checked = await assertOutboundUrl(current);
+      parsed = checked; // retain the final URL for naming/audit after redirects
       const step = await fetch(checked.toString(), {
         signal: controller.signal,
         redirect: 'manual',
@@ -177,26 +183,32 @@ export async function downloadToDownloads(
   // just gives TypeScript the same certainty
   const response = res as Response;
   if (!response.ok) {
+    clearTimeout(timeout);
+    void response.body?.cancel().catch(() => undefined);
     throw new DownloadError(`HTTP ${response.status} ${response.statusText} for ${parsed.hostname}`);
   }
 
   const declared = Number(response.headers.get('content-length') ?? 0);
   if (declared > maxDownloadBytes()) {
+    clearTimeout(timeout);
+    void response.body?.cancel().catch(() => undefined);
     throw new DownloadError(
       `File too large (${Math.round(declared / 1048576)} MB > limit ${Math.round(maxDownloadBytes() / 1048576)} MB)`
     );
   }
 
   const filename = sanitizeFilename(opts.filename || filenameFromHeaders(response.headers, parsed));
-  const finalPath = collisionSafePath(dir, filename);
-  const tmpPath = `${finalPath}.agentscope-part`;
+  let finalPath = collisionSafePath(dir, filename);
+  // A predictable shared temp path let two concurrent downloads truncate and
+  // interleave each other's bytes. Each writer gets its own exclusive file.
+  const tmpPath = `${finalPath}.${process.pid}.${randomUUID()}.agentscope-part`;
 
   const cap = maxDownloadBytes();
   let written = 0;
   try {
     const reader = response.body?.getReader();
     if (!reader) throw new DownloadError('Empty response body');
-    const fd = fs.openSync(tmpPath, 'w');
+    const fd = fs.openSync(tmpPath, 'wx');
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -209,12 +221,32 @@ export async function downloadToDownloads(
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmpPath, finalPath);
-  } catch (err) {
+
+    // Publish a complete inode atomically and never overwrite an existing
+    // file. If another writer won the same name, allocate the next suffix and
+    // retry; rename() cannot provide no-overwrite semantics cross-platform.
+    for (;;) {
+      try {
+        fs.linkSync(tmpPath, finalPath);
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        finalPath = collisionSafePath(dir, filename);
+      }
+    }
     try {
       fs.rmSync(tmpPath, { force: true });
-    } catch {
-      /* ignore */
+    } catch (cleanupError) {
+      // The final file is complete and valid; surface cleanup diagnostics
+      // without misreporting the download itself as failed.
+      console.error('[downloads] temporary file cleanup failed:', (cleanupError as Error)?.message);
+    }
+  } catch (err) {
+    controller.abort();
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch (cleanupError) {
+      console.error('[downloads] partial file cleanup failed:', (cleanupError as Error)?.message);
     }
     if (err instanceof DownloadError) throw err;
     const aborted = (err as Error)?.name === 'AbortError';
@@ -227,10 +259,12 @@ export async function downloadToDownloads(
     clearTimeout(timeout);
   }
 
+  const savedFilename = path.basename(finalPath);
+
   const result: DownloadResult = {
     path: finalPath,
     bytes: written,
-    filename,
+    filename: savedFilename,
     contentType: response.headers.get('content-type') ?? 'application/octet-stream',
     url: parsed.toString(),
     truncated: false,
@@ -246,7 +280,7 @@ export async function downloadToDownloads(
   });
   await createNotification({
     type: 'download',
-    title: `Downloaded ${filename}`,
+    title: `Downloaded ${savedFilename}`,
     body: `${Math.max(1, Math.round(written / 1024))} KB -> ${finalPath}`,
     taskId: opts.taskId,
     data: { path: finalPath, bytes: written, source: 'tool' },
