@@ -13,7 +13,8 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Voice me jawab | ✅ | edge-tts, Hindi voice |
 | Hindi/English baat-cheet | ✅ | LLM |
 | Context yaad rakhna / follow-up | ✅ | conversations + `memory.ts` |
-| Personality / tone set karna | 🟡 | per-agent prompt (Agent registry); dedicated tone setting nahi mila |
+| Personality / tone set karna | ✅ | **Character** tab: 5 persona (JARVIS / F.R.I.D.A.Y / Buddy / Mentor / Studio), nickname, humour + reply-length sliders, language — server-side (`persona.ts`), chat prompt me jaata hai |
+| Male / female / animated character | ✅ | `jarvis-avatar.tsx` (SVG + CSS, gender variants, idle/listening/thinking/speaking states) |
 
 ## Computer & System
 | Feature | Status | Tool |
@@ -28,6 +29,10 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Brightness | 🆕 | `desktop-brightness` (5–100, Windows panel) |
 | WiFi on/off + status | 🆕 | `desktop-wifi-set` (Administrator chahiye), `desktop-wifi-status` |
 | Bluetooth on/off | ❌ | workaround: `desktop-open-app` target `ms-settings:bluetooth` |
+| Folder banana | ✅ | `folder-create` (approval-gated `mkdir` host action) |
+| PC slow kyun hai (diagnosis) | ✅ | `pc-diagnose` + `/api/system/pc-health` — ranked findings, score/100 |
+| Music / playlist control | ✅ | `music-play` (YouTube search / Spotify) + `music-control` (media keys) |
+| WhatsApp message | 🟡 | `whatsapp-send` — WhatsApp Desktop me text tayyar hota hai, **Send user dabata hai** |
 | Mouse / keyboard / typing / clipboard | ✅ | `desktop-click/type/hotkey/scroll/clipboard-*` |
 | Screenshot | ✅ | `desktop-screenshot` |
 | Screen recording | 🆕 | `desktop-screen-record` (max 60 s, kill switch rokta hai) |
@@ -44,6 +49,7 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Google search, YouTube search | 🟡 | browser se search URL khol ke; dedicated search tool nahi |
 | Weather | ✅ | `weather-now` (Open-Meteo, key ki zaroorat nahi) |
 | News / headlines | ✅ | `news-headlines` (public RSS, topic-wise) |
+| **World Monitor** (live globe + hotspots) | ✅ | **World** tab: canvas globe (orthographic, drag, pulse), GDELT geo hotspots (24 h) + live headlines, `degraded` banner jab source down ho |
 
 ## Data & Research
 | Feature | Status | Note |
@@ -51,6 +57,7 @@ tests chale. Pehli baar chalane par ek baar khud try karo.
 | Text / code docs summarize | ✅ | knowledge base |
 | PDF / DOCX / XLSX / PPTX / ODT / RTF / EPUB padhna | ✅ | `documents.ts` (koi naya dependency nahi) + `document-read` tool + knowledge base import |
 | OCR (scanned PDF / photo ka text) | ❌ | `document-read` scan detect kar ke saaf bata deta hai ki OCR chahiye; OCR engine nahi hai |
+| Screen awareness (continuous) | 🟡 | `screen-watch` + `/api/screen/watch`: periodic screenshot → perceptual hash → **change events**; bank/password window par auto-pause. Samajhna (interpretation) abhi existing vision loop karta hai |
 | Charts banana | ❌ | UI me recharts hai, agent tool nahi |
 
 ## Scheduling

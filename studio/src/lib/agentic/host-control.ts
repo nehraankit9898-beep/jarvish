@@ -56,7 +56,9 @@ export type HostAction =
   /** delete to the RECYCLE BIN via send2trash — never a permanent rm */
   | { kind: 'trash'; path: string }
   /** download a URL into the user's Downloads folder */
-  | { kind: 'download'; url: string; filename?: string };
+  | { kind: 'download'; url: string; filename?: string }
+  /** create a folder (never overwrites a file) */
+  | { kind: 'mkdir'; path: string };
 
 export interface HostClassification {
   permission: Permission;
@@ -236,6 +238,21 @@ export function classifyHostAction(action: HostAction): HostClassification {
       return { permission: 'safe', reason: `${action.kind} a path`, paths: [target] };
     }
 
+    case 'mkdir': {
+      const target = canonical(action.path);
+      if (isSensitivePath(action.path)) {
+        return { permission: 'forbidden', reason: 'credential / browser-profile location', paths: [target] };
+      }
+      if (isSystemPath(action.path)) {
+        return { permission: 'forbidden', reason: 'system directory', paths: [target] };
+      }
+      // creating a folder that is already a FILE would be destructive
+      if (fs.existsSync(action.path) && !fs.statSync(action.path).isDirectory()) {
+        return { permission: 'destructive', reason: 'a FILE with this name exists', paths: [target] };
+      }
+      return { permission: 'review', reason: 'create a folder', paths: [target] };
+    }
+
     case 'write': {
       const target = canonical(action.path);
       if (isSensitivePath(action.path)) {
@@ -410,6 +427,8 @@ export function summarizeHostAction(a: HostAction): string {
       return `Recycle-bin delete ${a.path}`;
     case 'download':
       return `Download ${a.url}${a.filename ? ` as ${a.filename}` : ''}`;
+    case 'mkdir':
+      return `Create folder ${a.path}`;
   }
 }
 
@@ -557,6 +576,13 @@ async function execute(action: HostAction): Promise<HostResult> {
         if (action.append) fs.appendFileSync(file, action.content, 'utf8');
         else fs.writeFileSync(file, action.content, 'utf8');
         return done({ ok: true, data: { path: file, bytes: Buffer.byteLength(action.content, 'utf8') } });
+      }
+
+      case 'mkdir': {
+        const dir = path.resolve(expandHome(action.path));
+        const existed = fs.existsSync(dir);
+        fs.mkdirSync(dir, { recursive: true });
+        return done({ ok: true, data: { path: dir, created: !existed } });
       }
 
       case 'delete': {

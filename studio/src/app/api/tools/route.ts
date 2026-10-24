@@ -8,6 +8,7 @@ import { registerMemoryTools } from '@/lib/agentic/memory-tools';
 import { registerConnectorTools } from '@/lib/agentic/connector-tools';
 import { registerDocumentTools } from '@/lib/agentic/document-tools';
 import { registerInfoTools } from '@/lib/agentic/info-tools';
+import { registerPcTools } from '@/lib/agentic/pc-tools';
 import { loadActiveCustomTools } from '@/lib/agentic/custom-tools';
 
 export const runtime = 'nodejs';
@@ -21,6 +22,7 @@ async function ensureFullCatalog() {
   registerConnectorTools();
   registerDocumentTools();
   registerInfoTools();
+  registerPcTools();
   await loadActiveCustomTools().catch(() => 0);
 }
 

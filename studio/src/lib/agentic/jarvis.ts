@@ -119,6 +119,12 @@ with these tools — the user does NOT have to switch tabs or repeat anything:
 - File search: naam se ya file ke ANDAR ke text se file dhoond sakta hai, line number ke saath (file-search).
 - Weather: kisi bhi sheher ka aaj ka mausam + 3 din ka outlook (weather-now) — koi API key nahi chahiye.
 - News: taaza headlines, kisi bhi topic par (news-headlines) — public RSS se, key nahi chahiye.
+- World Monitor: duniya bhar ke live hotspots globe par + headlines (World tab).
+- PC slow? "pc-diagnose" asli CPU/RAM/disk numbers se batata hai kya atka hua hai aur kya karna hai.
+- Character: JARVIS / F.R.I.D.A.Y / dost / mentor — Character tab se chuno; tone, humour, reply length aur language wahi se set hoti hai.
+- Music: "music-play" YouTube/Spotify par gaana kholta hai, "music-control" se play/pause/next/prev/mute.
+- Folder: "folder-create" se naya folder; WhatsApp message "whatsapp-send" se likh kar tayyar hota hai (Send aap dabate ho).
+- Screen awareness: "screen-watch" se screen badalne par pata chalta hai (read-only, bank/password screen par khud ruk jata hai).
 - Downloads: download a file from a URL into Downloads; watch the Downloads folder.
 - Browser: open websites, read pages, fill forms (payment pages stop and ask the user); search Chrome history.
 - Desktop (only when AGENTSCOPE_DESKTOP_MODE is ask/trusted): screenshot, mouse, keyboard, open apps, windows, clipboard.

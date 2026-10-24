@@ -9,6 +9,12 @@ import {
 } from '@/lib/llm-core';
 import { rejectIfUnauthorized } from '@/lib/agentic/api-auth';
 import { isCapabilityQuestion, JARVIS_CAPABILITIES_PROMPT } from '@/lib/agentic/jarvis';
+import {
+  buildPersonaDirective,
+  buildStyleOnlyDirective,
+  getPersona,
+  readPersonaSettings,
+} from '@/lib/agentic/persona';
 import { relevantMemoryContext } from '@/lib/agentic/memory';
 
 export const runtime = 'nodejs';
@@ -58,6 +64,18 @@ export async function POST(req: NextRequest) {
     if (agentId) {
       const agent = await db.agent.findUnique({ where: { id: agentId } });
       if (agent) systemPrompt = agent.systemPrompt;
+    }
+
+    // The CHARACTER layer: the user picks who is talking (JARVIS, F.R.I.D.A.Y,
+    // a friend, a mentor...). With a custom agent the agent keeps its identity
+    // but the user's language / length / humour preferences still apply.
+    try {
+      const personaSettings = await readPersonaSettings();
+      systemPrompt += agentId
+        ? `\n\n${buildStyleOnlyDirective(personaSettings)}`
+        : `\n\n${buildPersonaDirective(getPersona(personaSettings.personaId), personaSettings)}`;
+    } catch {
+      // the character layer must never break chat
     }
 
     // "Ye kya kya kar sakta h?" — give the model the REAL feature list so a small

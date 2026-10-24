@@ -200,6 +200,23 @@ Bridge sirf **127.0.0.1** pe bind hota hai, token (`db/.desktop-token`) ke bina 
 Poora troubleshooting table: [`studio/docs/WINDOWS_SETUP.md`](studio/docs/WINDOWS_SETUP.md) §7.
 
 
+## Character, World Monitor & PC skills (this session)
+
+Audit ke gaps par kaam — jo pehle missing/partial tha:
+
+| Kya | Kaise | Note |
+|---|---|---|
+| **Character / persona** | sidebar → **Character** | 5 persona (JARVIS, F.R.I.D.A.Y, Buddy, Mentor, Studio), male/female/neutral avatar (SVG+CSS, idle/listening/thinking/speaking), nickname, humour + reply-length sliders, language. Server-side save, chat system prompt me inject |
+| **World Monitor** | sidebar → **World** | Canvas globe (orthographic, drag + auto-rotate, pulsing hotspots), GDELT geo events (24 h) + live headlines, category filters, source-down par `degraded` banner |
+| **PC slow kyun hai** | tool `pc-diagnose`, `GET /api/system/pc-health` | Asli CPU/RAM/disk/process numbers → ranked findings + score /100 (deterministic rules) |
+| **Folder banana** | tool `folder-create` | Naya `mkdir` host action — approval-gated, allowed-roots ke andar |
+| **Music control** | tools `music-play`, `music-control` | YouTube search / Spotify URI kholta hai; play/pause/next/prev/mute media keys se |
+| **WhatsApp message** | tool `whatsapp-send` | WhatsApp Desktop me text pre-filled; **Send user dabata hai** (agent chup-chaap bhej nahi sakta) |
+| **Screen awareness** | tool `screen-watch`, `/api/screen/watch` | Periodic screenshot → perceptual hash → change events; bank/password window par auto-pause; screenshots save nahi hote |
+
+Ab bhi baaki: **Stonic Remote** (phone se two-way live voice) — uske liye WebRTC/TURN ya relay +
+pairing auth chahiye; agla bada kaam wahi hai. OCR aur Bluetooth bhi waise hi pending hain.
+
 ## Documents, file search, weather & news (latest session)
 
 Studio ab wo cheezein bhi kar sakta hai jo pehle **missing** thi (`docs/CAPABILITY_MATRIX.md` me ✅ ho gayi hain):
